@@ -1,0 +1,16 @@
+#!/bin/sh
+#SBATCH --job-name LapDDPM         # this is a parameter to help you sort your job when listing it
+#SBATCH --ntasks 1                    # number of tasks in your job. One by default
+#SBATCH --cpus-per-task 1
+#SBATCH --partition=LocalQ
+#SBATCH --error run_lap%j.err     # optional. By default a file slurm-{jobid}.out will be created
+#SBATCH --output run_lap%j.out      # optional. By default the error and output files are merged
+#SBATCHP --gres=gpu:1
+#SBATCH --time 0-04:14:59                  # maximum run time.
+
+## USED ython 3.8.18
+source $HOME/.bashrc
+conda activate genomics
+nvidia-smi
+
+python -u lap_ddpm.py

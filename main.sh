@@ -1,0 +1,1 @@
+python -u lap_ddpm.py > run_lap.out 2> run_lap.err
