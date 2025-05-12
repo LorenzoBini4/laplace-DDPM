@@ -2,7 +2,8 @@ import torch
 from torch_scatter import scatter_add
 import torch.nn.functional as F
 from torch_geometric.nn import GCNConv
-from torch_geometric.data import DataLoader, InMemoryDataset, Data
+from torch_geometric.data import InMemoryDataset, Data
+from torch_geometric.loader import DataLoader
 import pandas as pd
 import numpy as np
 from sklearn.neighbors import NearestNeighbors
@@ -99,12 +100,14 @@ class SpectralGNNEncoder(torch.nn.Module):
         super().__init__()
         self.conv1 = GCNConv(in_dim, hid_dim)
         self.conv2 = GCNConv(hid_dim, hid_dim)
+        self.conv3 = GCNConv(hid_dim, hid_dim)
         self.lin_mu = torch.nn.Linear(hid_dim, lat_dim)
         self.lin_logvar = torch.nn.Linear(hid_dim, lat_dim)
 
     def forward(self, x, edge_index, weights):
         h = F.relu(self.conv1(x, edge_index, weights))
-        h = self.conv2(h, edge_index, weights)
+        h = F.relu(self.conv2(h, edge_index, weights))
+        h = self.conv3(h, edge_index, weights)
         mu = self.lin_mu(h)
         logvar = self.lin_logvar(h)
         return mu, logvar
@@ -187,7 +190,8 @@ class Trainer:
                  list(self.denoiser.parameters()) + \
                  list(self.diff.parameters()) + \
                  list(self.decoder.parameters())
-        self.optim = torch.optim.Adam(params, lr=lr)
+        unique_params = list({id(p): p for p in params}.values())
+        self.optim = torch.optim.Adam(unique_params, lr=lr)
         self.scaler = torch.cuda.amp.GradScaler()
 
     def train_epoch(self, loader):
@@ -212,7 +216,7 @@ class Trainer:
                 # Reconstruction
                 x_rec = self.decoder(mu)
                 loss_rec = F.mse_loss(x_rec, data.x)
-                loss = loss_diff + kl + loss_adv + loss_rec
+                loss = loss_diff + kl*1e-3 + loss_adv*0.5 + loss_rec*1e-2
             self.optim.zero_grad()
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optim)
