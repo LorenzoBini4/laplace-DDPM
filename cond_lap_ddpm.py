@@ -224,8 +224,8 @@ class FeatureDecoder(nn.Module):
     def __init__(self, lat_dim, hid_dim, out_dim):
         super().__init__()
         self.decoder = nn.Sequential(
-            nn.Linear(lat_dim, hid_dim), nn.ReLU(),
-            nn.Linear(hid_dim, hid_dim), nn.ReLU(),
+            nn.Linear(lat_dim, hid_dim), nn.LayerNorm(hid_dim), nn.ReLU(),
+            nn.Linear(hid_dim, hid_dim), nn.LayerNorm(hid_dim), nn.ReLU(),
             nn.Linear(hid_dim, out_dim)
         )
 
@@ -326,7 +326,7 @@ if __name__ == '__main__':
         hid_dim=512,
         lat_dim=512,
         cond_dim=512,
-        timesteps=500,
+        timesteps=1000,
         lr=1e-5
     )
 
