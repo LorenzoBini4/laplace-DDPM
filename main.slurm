@@ -3,8 +3,8 @@
 #SBATCH --ntasks 1                    # number of tasks in your job. One by default
 #SBATCH --cpus-per-task 1
 #SBATCH --partition=LocalQ
-#SBATCH --error run_lap%j.err     # optional. By default a file slurm-{jobid}.out will be created
-#SBATCH --output run_lap%j.out      # optional. By default the error and output files are merged
+#SBATCH --error run_cond_lap%j.err     # optional. By default a file slurm-{jobid}.out will be created
+#SBATCH --output run_cond_lap%j.out      # optional. By default the error and output files are merged
 #SBATCH --gres=gpu:1
 #SBATCH --time 0-04:14:59                  # maximum run time.
 
@@ -13,4 +13,5 @@ source $HOME/.bashrc
 conda activate genomics
 nvidia-smi
 
-python -u lap_ddpm.py
+# python -u lap_ddpm.py
+python -u cond_lap_ddpm.py
