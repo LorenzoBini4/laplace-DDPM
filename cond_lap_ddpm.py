@@ -21,7 +21,8 @@ torch.backends.cudnn.benchmark = True
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 class MerfishCellGraphDataset(InMemoryDataset):
-    def __init__(self, csv_path, k=7, root='data'):
+    def __init__(self, csv_path, k=7, root='data', train=True):
+        self.train = train
         self.csv_path = csv_path
         self.k = k
         super().__init__(root)
@@ -34,9 +35,13 @@ class MerfishCellGraphDataset(InMemoryDataset):
     def raw_file_names(self):
         return []
 
+    # @property
+    # def processed_file_names(self):
+    #     return ['data.pt']
+    
     @property
     def processed_file_names(self):
-        return ['data.pt']
+        return ['test_data.pt' if not self.train else 'train_data.pt']
 
     def download(self):
         pass
@@ -360,3 +365,28 @@ if __name__ == '__main__':
     for i, (real, gen) in enumerate(zip(real_graphs, gen_graphs)):
         print(f"Graph {i}: Real x shape: {real.x.shape}, Gen x shape: {gen.x.shape}, Gen edge_index shape: {gen.edge_index.shape}")
     print("Training and evaluation completed.")
+    
+# Load test dataset
+test_dataset = MerfishCellGraphDataset('data/merfish_test.csv', k=7, root='data')
+
+# Generation & Evaluation on TEST SET
+test_real_graphs = [test_dataset[i].to(device) for i in range(len(test_dataset))]
+gen_graphs = []
+
+for test_g in test_real_graphs:
+    # Encode TEST graph to get conditioning
+    with torch.no_grad():
+        test_lap_pe = compute_lap_pe(test_g.edge_index, test_g.num_nodes, k=10).to(device)
+        test_mu, _ = trainer.encoder(test_g.x, test_g.edge_index, test_lap_pe)
+    
+    # Generate from TEST conditions
+    z_shape = (test_g.num_nodes, trainer.encoder.mu.out_features)
+    z_gen = trainer.diff.sample(z_shape, cond=test_mu)
+    x_gen = trainer.decoder(z_gen)
+    
+    # Create generated graph with TEST's edge index (if generating novel structures, modify this)
+    gen_graphs.append(Data(x=x_gen, edge_index=test_g.edge_index))
+
+# Evaluate against TEST set ground truth
+test_results = trainer.evaluate(test_real_graphs, gen_graphs)
+print('Test Set Metrics:', test_results)
