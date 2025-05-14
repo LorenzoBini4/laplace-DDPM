@@ -14,6 +14,7 @@ import scipy.sparse as sp
 from scipy.sparse.linalg import eigsh
 from torch_geometric.utils import get_laplacian
 from torch_geometric.nn import ChebConv
+import torch_geometric.utils
 
 # Enable CuDNN benchmarking for optimal kernels
 torch.backends.cudnn.benchmark = True
@@ -103,9 +104,15 @@ def compute_lap_pe(edge_index, num_nodes, k=10):
     pe = torch.from_numpy(eigvecs[:, 1:k+1]).float().to(device)
     return pe
 
+def add_self_loops(edge_index, edge_weight, num_nodes=None):
+    edge_index, _ = torch_geometric.utils.add_self_loops(edge_index, num_nodes=num_nodes)
+    if edge_weight is not None:
+        edge_weight = torch.cat([edge_weight, torch.ones(edge_index.size(1)-edge_weight.size(0))])
+    return edge_index, edge_weight
+
 # Adversarial Laplacian Perturbation
 class LaplacianPerturb:
-    def __init__(self, alpha_min=0.0001, alpha_max=0.01):
+    def __init__(self, alpha_min=1e-4, alpha_max=1e-3):
         self.alpha_min = alpha_min
         self.alpha_max = alpha_max
 
@@ -117,6 +124,7 @@ class LaplacianPerturb:
         return weights
     
     def adversarial(self, model, x, edge_index, weights, xi=1e-6, epsilon=0.1, ip=1):
+        w = weights.clone().detach().requires_grad_(True)
         # Keep all tensors on GPU
         edge_index = edge_index.to(x.device)
         num_nodes = x.size(0)
@@ -125,7 +133,7 @@ class LaplacianPerturb:
         edge_i, edge_j = edge_index
         adj = torch.sparse_coo_tensor(
             edge_index,
-            weights,
+            w,
             (num_nodes, num_nodes)
         )
         
@@ -158,7 +166,7 @@ class LaplacianPerturb:
             model.zero_grad()
 
         # Final perturbation projection
-        return weights + epsilon * F.normalize(w - weights, p=2, dim=0)
+        return w + epsilon * F.normalize(w.grad, p=2, dim=0)
 
 # Spectral Encoder
 class SpectralEncoder(nn.Module):
@@ -169,10 +177,10 @@ class SpectralEncoder(nn.Module):
         self.mu = nn.Linear(hid_dim, lat_dim)
         self.logvar = nn.Linear(hid_dim, lat_dim)
 
-    def forward(self, x, edge_index, lap_pe):
+    def forward(self, x, edge_index, lap_pe, edge_weight=None):
         x = torch.cat([x, lap_pe], dim=1)
-        x = F.relu(self.cheb1(x, edge_index))
-        x = F.relu(self.cheb2(x, edge_index))
+        x = F.relu(self.cheb1(x, edge_index, edge_weight))
+        x = F.relu(self.cheb2(x, edge_index, edge_weight))
         x = x.mean(dim=0, keepdim=True)
         return self.mu(x), self.logvar(x)
 
@@ -260,12 +268,21 @@ class Trainer:
         for data in loader:
             data = data.to(device)
             lap_pe = data.lap_pe.to(device)  # Precomputed, GPU transfer
+            # 1. Sample and perturb edge weights
+            weights = self.lap_pert.sample(data.edge_index, data.num_nodes)
+            adv_weights = self.lap_pert.adversarial(
+                self.encoder, data.x, data.edge_index, weights
+            )
+            
+            # 2. Create perturbed adjacency matrix
+            edge_index, edge_weight = add_self_loops(data.edge_index, adv_weights)
+            
             self.optim.zero_grad()
 
             # Mixed precision context
             with torch.cuda.amp.autocast():
                 # Forward pass
-                mu, logvar = self.encoder(data.x, data.edge_index, lap_pe)
+                mu, logvar = self.encoder(data.x, edge_index, lap_pe, edge_weight)
                 z = mu + logvar.mul(0.5).exp() * torch.randn_like(mu)
                 xt = self.diff.sample(z.shape, cond=mu)
                 eps_pred = self.denoiser(xt, cond=mu)
@@ -275,7 +292,8 @@ class Trainer:
                 kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
                 x_rec = self.decoder(mu)
                 loss_rec = F.mse_loss(x_rec, data.x.mean(dim=0, keepdim=True))
-                loss = loss_diff*0.1 + kl * 0.05 + loss_rec * 1.0
+                loss_pert = torch.mean((adv_weights - weights)**2)
+                loss = loss_diff*0.1 + kl*0.05 + loss_rec*1.0 + loss_pert*0.01
 
             # Scaled backward pass
             self.scaler.scale(loss).backward()
@@ -332,7 +350,7 @@ if __name__ == '__main__':
         lat_dim=512,
         cond_dim=512,
         timesteps=1000,
-        lr=1e-7
+        lr=1e-4
     )
 
     # Training loop
