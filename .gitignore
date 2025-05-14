@@ -10,9 +10,11 @@ __pycache__/
 *img-res/
 *output/
 *data/
+*data*/
 *.csv
 *delme/
 delme*
+*_delme
 # Distribution / packaging
 .Python
 build/

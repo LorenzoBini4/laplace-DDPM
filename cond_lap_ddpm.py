@@ -291,8 +291,8 @@ class Trainer:
             
             total_loss += loss.item()
 
-        # Update learning rate scheduler
-        self.scheduler.step()
+            # Update learning rate scheduler after optimizer step
+            self.scheduler.step()
         return total_loss / len(loader)
 
     def evaluate(self, real_list, gen_list):
@@ -332,11 +332,11 @@ if __name__ == '__main__':
         lat_dim=512,
         cond_dim=512,
         timesteps=1000,
-        lr=1e-7
+        lr=1e-3
     )
 
     # Training loop
-    for epoch in range(1, 10001):
+    for epoch in range(1, 5001):
         loss = trainer.train_epoch(loader)
         print(f'Epoch {epoch:03d}, Loss: {loss:.4f}')
 

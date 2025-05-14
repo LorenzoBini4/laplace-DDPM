@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from torch_scatter import scatter_add
+from torch_scatter import scatter_add, scatter_mean
 import torch.nn.functional as F
 from torch_geometric.nn import GCNConv
 from torch_geometric.data import InMemoryDataset, Data
@@ -118,55 +118,35 @@ class LaplacianPerturb:
 
     def sample(self, edge_index, num_nodes):
         alpha = torch.rand(1, device=device) * (self.alpha_max - self.alpha_min) + self.alpha_min
-        E = edge_index.size(1)
-        signs = torch.randint(0, 2, (E,), device=device) * 2 - 1
-        weights = 1.0 + alpha * signs.float()
-        return weights
+        signs = torch.randint(0, 2, (edge_index.size(1),), device=device) * 2 - 1
+        return 1.0 + alpha * signs.float()
     
     def adversarial(self, model, x, edge_index, weights, xi=1e-6, epsilon=0.1, ip=1):
-        w = weights.clone().detach().requires_grad_(True)
-        # Keep all tensors on GPU
-        edge_index = edge_index.to(x.device)
-        num_nodes = x.size(0)
-        
-        # Use PyTorch sparse tensors
-        edge_i, edge_j = edge_index
+        """Memory-optimized adversarial perturbation using sparse operations"""
+        # Convert to sparse tensor format
         adj = torch.sparse_coo_tensor(
             edge_index,
-            w,
-            (num_nodes, num_nodes)
-        )
+            weights,
+            (x.size(0), x.size(0)),
+            device=x.device
+        ).coalesce()
         
-        # Symmetrize using sparse operations
-        adj = (adj + adj.t()).coalesce()
+        # Sparse eigenvalue approximation (Lanczos)
+        with torch.no_grad():
+            # Approximate largest eigenvector using power iteration
+            v = torch.randn(adj.size(0), 1, device=x.device)
+            for _ in range(3):  # 3 power iterations
+                v = torch.sparse.mm(adj, v)
+                v /= v.norm()
+            
+            # Approximate eigenvector-based perturbation
+            delta = xi * v @ v.T
+            delta = delta.to_sparse().coalesce()
         
-        # Degree computation using sparse
-        deg = torch.sparse.sum(adj, dim=1).to_dense()
-        L = -adj.to_dense()
-        L[range(num_nodes), range(num_nodes)] += deg
+        # Merge perturbations (sparse-safe)
+        perturbed_weights = weights + epsilon * delta.values()[adj.indices()[0], adj.indices()[1]]
         
-        # Eigendecomposition
-        with torch.cuda.amp.autocast(enabled=False):
-            L = L.float()
-            eigvals, eigvecs = torch.linalg.eigh(L)
-        
-            lap_pe = eigvecs[:, 1:11]  # First k=10 non-trivial
-
-            # Forward encoder
-            mu, _ = model(x, edge_index.to(x.device), lap_pe)
-
-            loss = (mu ** 2).mean()
-            loss.backward()
-
-            if w.grad is None:
-                raise RuntimeError("No gradient on adversarial weights")
-
-            g_norm = F.normalize(w.grad, p=2, dim=0)
-            w = (w + xi * g_norm).detach().requires_grad_(True)
-            model.zero_grad()
-
-        # Final perturbation projection
-        return w + epsilon * F.normalize(w.grad, p=2, dim=0)
+        return perturbed_weights.clamp(0.5, 1.5)  # Keep weights in reasonable range
 
 # Spectral Encoder
 class SpectralEncoder(nn.Module):
@@ -179,9 +159,12 @@ class SpectralEncoder(nn.Module):
 
     def forward(self, x, edge_index, lap_pe, edge_weight=None):
         x = torch.cat([x, lap_pe], dim=1)
+        # Convert to edge_index + edge_weight format
+        edge_index, edge_weight = torch_geometric.utils.add_self_loops(
+            edge_index, edge_weight, num_nodes=x.size(0))
         x = F.relu(self.cheb1(x, edge_index, edge_weight))
         x = F.relu(self.cheb2(x, edge_index, edge_weight))
-        x = x.mean(dim=0, keepdim=True)
+        x = scatter_mean(x, torch.zeros(x.size(0), dtype=torch.long, device=x.device), dim=0)
         return self.mu(x), self.logvar(x)
 
 # ScoreNet with classifier-free guidance
@@ -270,12 +253,11 @@ class Trainer:
             lap_pe = data.lap_pe.to(device)  # Precomputed, GPU transfer
             # 1. Sample and perturb edge weights
             weights = self.lap_pert.sample(data.edge_index, data.num_nodes)
-            adv_weights = self.lap_pert.adversarial(
-                self.encoder, data.x, data.edge_index, weights
-            )
+            # adv_weights = self.lap_pert.adversarial(
+                # self.encoder, data.x, data.edge_index, weights)
             
-            # 2. Create perturbed adjacency matrix
-            edge_index, edge_weight = add_self_loops(data.edge_index, adv_weights)
+            # 2. Adversarial perturbation (sparse-aware)
+            edge_index, edge_weight = self.lap_pert.adversarial(self.encoder, data.x, data.edge_index, weights)                
             
             self.optim.zero_grad()
 
@@ -292,8 +274,8 @@ class Trainer:
                 kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
                 x_rec = self.decoder(mu)
                 loss_rec = F.mse_loss(x_rec, data.x.mean(dim=0, keepdim=True))
-                loss_pert = torch.mean((adv_weights - weights)**2)
-                loss = loss_diff*0.1 + kl*0.05 + loss_rec*1.0 + loss_pert*0.01
+                # loss_pert = torch.mean((adv_weights - weights)**2)
+                loss = loss_diff*0.1 + kl*0.05 + loss_rec*1.0 # + loss_pert*0.01
 
             # Scaled backward pass
             self.scaler.scale(loss).backward()
@@ -309,8 +291,8 @@ class Trainer:
             
             total_loss += loss.item()
 
-        # Update learning rate scheduler
-        self.scheduler.step()
+            # Update learning rate scheduler
+            self.scheduler.step()
         return total_loss / len(loader)
 
     def evaluate(self, real_list, gen_list):
@@ -354,7 +336,7 @@ if __name__ == '__main__':
     )
 
     # Training loop
-    for epoch in range(1, 10001):
+    for epoch in range(1, 5001):
         loss = trainer.train_epoch(loader)
         print(f'Epoch {epoch:03d}, Loss: {loss:.4f}')
 
