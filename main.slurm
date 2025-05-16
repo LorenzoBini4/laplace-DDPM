@@ -12,6 +12,8 @@
 source $HOME/.bashrc
 conda activate genomics
 nvidia-smi
+
 # python -u lap_ddpm.py
 python -u cond_lap_ddpm.py
-# python -u adv_cond_lap_ddpm.py > adv_run_cond_lap.o 2> adv_run_cond_lap.e
+# python -u adv_cond_lap_ddpm.py 
+# python -u delme.py 
