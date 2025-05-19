@@ -1647,19 +1647,19 @@ if __name__ == '__main__':
     # If processing multiple smaller graphs or implementing manual minibatching of nodes, this would change.
     BATCH_SIZE = 1
 
-    LEARNING_RATE = 5e-5 # Learning rate for Adam optimizer
-    EPOCHS = 3000 # Number of training epochs
+    LEARNING_RATE = 1e-4 # Learning rate for Adam optimizer
+    EPOCHS = 1000 # Number of training epochs
     HIDDEN_DIM = 1024 # Hidden dimension for GNN and MLPs
     LATENT_DIM = 512 # Dimension of the latent space for diffusion
     PE_DIM = 20 # Dimension of Laplacian Positional Encoding
     K_NEIGHBORS = 20 # Number of neighbors for KNN graph on cells
     PCA_NEIGHBORS = 50 # Number of PCA components to use before KNN graph construction
     GENE_THRESHOLD = 20 # Minimum number of cells a gene must be expressed in (applied across the loaded split)
-    TIMESTEPS_DIFFUSION = 1500 # Number of diffusion timesteps (N in ScoreSDE)
+    TIMESTEPS_DIFFUSION = 1000 # Number of diffusion timesteps (N in ScoreSDE)
 
     # Loss Weights - balance diffusion, KL, and reconstruction losses
     # These may need tuning based on observed loss values during training
-    loss_weights = {'diff': 0.001, 'kl': 0.07, 'rec': 11.0} # Increased reconstruction weight as it's on raw counts
+    loss_weights = {'diff': 1.0, 'kl': 0.1, 'rec': 10.0} # Increased reconstruction weight as it's on raw counts
 
     # Dataset Paths (Relative to script location or absolute)
     # Assumes pbmc3k_test.h5ad and pbmc3k_train.h5ad are in a 'data' subdirectory
