@@ -3,8 +3,8 @@
 #SBATCH --ntasks 1                    # number of tasks in your job. One by default
 #SBATCH --cpus-per-task 1
 #SBATCH --partition=LocalQ
-#SBATCH --error run_scrna_ddpm.%j.err     # optional. By default a file slurm-{jobid}.out will be created
-#SBATCH --output run_scrna_ddpm.%j.out      # optional. By default the error and output files are merged
+#SBATCH --error run_scrna_ddpm_denta.%j.err     # optional. By default a file slurm-{jobid}.out will be created
+#SBATCH --output run_scrna_ddpm_denta.%j.out      # optional. By default the error and output files are merged
 #SBATCH --gres=gpu:1
 #SBATCH --time 0-04:14:59                  # maximum run time.
 
@@ -17,4 +17,5 @@ nvidia-smi
 # python -u cond_lap_ddpm.py
 # python -u adv_cond_lap_ddpm.py 
 # python -u delme.py 
-python -u scrna_cond_ddpm.py 
+# python -u scrna_cond_ddpm.py 
+python -u scrna_cond_ddpm_v2_denta.py 

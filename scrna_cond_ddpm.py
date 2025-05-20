@@ -20,6 +20,7 @@ import anndata as ad
 from sklearn.decomposition import PCA
 from scipy.spatial.distance import cdist # For pairwise distances in Wasserstein and MMD
 import sys # For checking installed modules
+import random
 
 # Check for required libraries
 try:
@@ -48,6 +49,19 @@ except Exception as e:
     device = torch.device('cpu')
 
 print(f"Using device: {device}")
+
+def set_seed(seed):
+    """Set random seeds for reproducibility."""
+    if seed is not None:
+        print(f"Setting random seed to {seed}")
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        # Optional: Set deterministic operations for CUDA if needed, can impact performance
+        # torch.backends.cudnn.deterministic = True
+        # torch.backends.cudnn.benchmark = False # Setting to False might slow down training
 
 # Helper function for Laplacian PE (kept mostly the same, ensuring robustness)
 def compute_lap_pe(edge_index, num_nodes, k=10):
@@ -1127,7 +1141,7 @@ class Trainer:
 
                 # KL Divergence Loss (from encoder's latent distribution to standard normal)
                 # KL is computed per node and then averaged over the batch
-                kl_div = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=-1) # Sum over lat_dim -> [num_nodes]
+                kl_div = 0.5 * torch.sum(mu.pow(2) + logvar.exp() - 1 - logvar, dim=-1).mean() # Sum over lat_dim -> [num_nodes]
                 kl_div = kl_div.mean() # Mean over batch -> scalar
 
 
@@ -1208,8 +1222,13 @@ class Trainer:
             torch.nn.utils.clip_grad_norm_(self.all_params, max_norm=1.0)
             self.scaler.step(self.optim)
             self.scaler.update()
-            self.scheduler.step() # Step the learning rate scheduler
-            self.current_step += 1 # Increment the global step counter
+            self.scheduler.step()          # LR lambda 
+            self.current_step += 1          
+            print(f"[DEBUG] optim steps: {self.optim._step_count}, scheduler steps: {self.scheduler._step_count}")
+            print(f"[DEBUG] LR now = {self.optim.param_groups[0]['lr']:.6f}")
+            # debug-print the actual LR
+            lr = self.optim.param_groups[0]["lr"]
+            print(f"[DEBUG] epoch {epoch+1} batch {self.current_step}: lr = {lr:.6e}")
 
             # Accumulate losses for reporting
             total_loss_val += final_loss.item()
@@ -1229,7 +1248,6 @@ class Trainer:
         else:
              print("Warning: No batches processed in this epoch.")
              return 0.0 # Return 0 if no batches processed
-
 
     @torch.no_grad()
     def generate(self, num_samples, cell_type_condition=None):
@@ -1645,10 +1663,10 @@ if __name__ == '__main__':
     # --- Configuration ---
     # BATCH_SIZE is typically 1 for DataLoader when loading a single large graph (dataset split)
     # If processing multiple smaller graphs or implementing manual minibatching of nodes, this would change.
-    BATCH_SIZE = 1
+    BATCH_SIZE = 64
 
-    LEARNING_RATE = 1e-4 # Learning rate for Adam optimizer
-    EPOCHS = 1000 # Number of training epochs
+    LEARNING_RATE = 1e-3 # Learning rate for Adam optimizer
+    EPOCHS = 3000 # Number of training epochs
     HIDDEN_DIM = 1024 # Hidden dimension for GNN and MLPs
     LATENT_DIM = 512 # Dimension of the latent space for diffusion
     PE_DIM = 20 # Dimension of Laplacian Positional Encoding
@@ -1656,10 +1674,12 @@ if __name__ == '__main__':
     PCA_NEIGHBORS = 50 # Number of PCA components to use before KNN graph construction
     GENE_THRESHOLD = 20 # Minimum number of cells a gene must be expressed in (applied across the loaded split)
     TIMESTEPS_DIFFUSION = 1000 # Number of diffusion timesteps (N in ScoreSDE)
+    GLOBAL_SEED = 69 
+    set_seed(GLOBAL_SEED)
 
     # Loss Weights - balance diffusion, KL, and reconstruction losses
     # These may need tuning based on observed loss values during training
-    loss_weights = {'diff': 1.0, 'kl': 0.1, 'rec': 10.0} # Increased reconstruction weight as it's on raw counts
+    loss_weights = {'diff': 1.0, 'kl': 0.7, 'rec': 10.0} # Increased reconstruction weight as it's on raw counts
 
     # Dataset Paths (Relative to script location or absolute)
     # Assumes pbmc3k_test.h5ad and pbmc3k_train.h5ad are in a 'data' subdirectory
