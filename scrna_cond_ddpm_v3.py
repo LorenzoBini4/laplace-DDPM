@@ -964,7 +964,15 @@ def generate_qualitative_plots(real_adata_filtered, generated_counts, generated_
                                output_dir="qualitative_plots", umap_neighbors=15, model_name="Our Model"):
     """
     Generates and saves qualitative evaluation plots.
-    (Args documentation as before)
+    Args:
+        real_adata_filtered (anndata.AnnData): Filtered real AnnData object (test set).
+        generated_counts (np.ndarray): Generated gene expression counts.
+        generated_cell_types (np.ndarray): Generated cell type labels (integer codes).
+        train_cell_type_categories (list): List of cell type names from training data.
+        train_filtered_gene_names (list): List of filtered gene names from training data.
+        output_dir (str): Directory to save plots.
+        umap_neighbors (int): Number of neighbors for UMAP.
+        model_name (str): Name of the model for plot titles.
     """
     print(f"\n--- Generating Qualitative Plots in {output_dir} for {model_name} ---")
     os.makedirs(output_dir, exist_ok=True)
@@ -974,12 +982,11 @@ def generate_qualitative_plots(real_adata_filtered, generated_counts, generated_
     else:
         real_counts_np = np.asarray(real_adata_filtered.X)
 
-    # --- Figure 1a: Mean-Variance Plot (Assumed to be working, kept for context) ---
+    # --- Figure 1a: Mean-Variance Plot ---
     print("Plotting Figure 1a: Mean-Variance Relationship...")
     if real_counts_np.shape[0] > 0 and generated_counts.shape[0] > 0 and \
        real_counts_np.shape[1] > 0 and generated_counts.shape[1] > 0 and \
        real_counts_np.shape[1] == generated_counts.shape[1]:
-        # ... (mean-variance plotting code from your previous working version) ...
         real_means = np.mean(real_counts_np, axis=0)
         real_vars = np.var(real_counts_np, axis=0)
         gen_means = np.mean(generated_counts, axis=0)
@@ -1006,10 +1013,9 @@ def generate_qualitative_plots(real_adata_filtered, generated_counts, generated_
     else:
         print("Skipping Figure 1a: Real or generated data is empty, or gene dimensions mismatch.")
 
-    # --- Figure 1b: Sparsity (Zeros per Cell) (Assumed to be working, kept for context) ---
+    # --- Figure 1b: Sparsity (Zeros per Cell) ---
     print("Plotting Figure 1b: Zeros per Cell Distribution...")
     if real_counts_np.shape[0] > 0 and generated_counts.shape[0] > 0:
-        # ... (zeros per cell plotting code from your previous working version) ...
         real_zeros_per_cell = (real_counts_np == 0).sum(axis=1)
         gen_zeros_per_cell = (generated_counts == 0).sum(axis=1)
         plt.figure(figsize=(8, 6))
@@ -1069,7 +1075,8 @@ def generate_qualitative_plots(real_adata_filtered, generated_counts, generated_
         )
 
         adata_real_copy.var_names = [str(name) for name in adata_real_copy.var_names]
-        
+        adata_gen.var_names = [str(name) for name in adata_gen.var_names] # Ensure generated var_names are strings
+
         common_genes = list(set(adata_real_copy.var_names) & set(adata_gen.var_names))
         if not common_genes:
             print("Error: No common genes between real and generated AnnData for UMAP. Check gene name consistency. Skipping UMAP.")
@@ -1097,24 +1104,13 @@ def generate_qualitative_plots(real_adata_filtered, generated_counts, generated_
             try:
                 n_top_genes_hvg = min(2000, adata_combined.shape[1] -1 if adata_combined.shape[1] > 1 else 1)
                 if n_top_genes_hvg > 0:
-                    print("Attempting HVG selection with flavor 'seurat_v3'. If this fails, try 'pip install scikit-misc'")
-                    sc.pp.highly_variable_genes(adata_combined, n_top_genes=n_top_genes_hvg, flavor='seurat_v3', batch_key='source_umap')
+                    # FIX: Changed flavor to 'cell_ranger' as it's more robust to non-integer inputs after normalization/log1p
+                    print("Performing HVG selection with flavor 'cell_ranger'.")
+                    sc.pp.highly_variable_genes(adata_combined, n_top_genes=n_top_genes_hvg, flavor='cell_ranger', batch_key='source_umap')
                     adata_combined_hvg = adata_combined[:, adata_combined.var.highly_variable].copy()
                 else:
                     print("Warning: Not enough genes for HVG selection. Using all genes.")
-            except ImportError: # Specifically catch ImportError for skmisc
-                 print("ImportError: `scikit-misc` not found, which is required for `seurat_v3` HVG. "
-                       "Falling back to 'cell_ranger' flavor for HVG or install with `pip install scikit-misc`.")
-                 try:
-                     if n_top_genes_hvg > 0:
-                        sc.pp.highly_variable_genes(adata_combined, n_top_genes=n_top_genes_hvg, flavor='cell_ranger', batch_key='source_umap')
-                        adata_combined_hvg = adata_combined[:, adata_combined.var.highly_variable].copy()
-                     else:
-                        print("Warning: Not enough genes for HVG selection. Using all genes.")
-                 except Exception as e_hvg_fallback:
-                     print(f"HVG selection with 'cell_ranger' also failed: {e_hvg_fallback}. Using all genes.")
-                     adata_combined_hvg = adata_combined.copy() # Fallback to all genes
-            except Exception as e_hvg: # Other errors during HVG
+            except Exception as e_hvg: # Catch any error during HVG
                  print(f"Error selecting HVGs: {e_hvg}. Using all genes for PCA/UMAP.")
                  adata_combined_hvg = adata_combined.copy()
 
@@ -1134,28 +1130,39 @@ def generate_qualitative_plots(real_adata_filtered, generated_counts, generated_
                         sc.pp.neighbors(adata_combined_hvg, n_neighbors=current_umap_neighbors, use_rep='X_pca')
                         sc.tl.umap(adata_combined_hvg, min_dist=0.3)
                         
-                        plt.figure()
-                        # Set known colors for 'source_umap' in .uns
-                        # This is more robust for Scanpy's handling when color is a list
+                        plt.figure(figsize=(12, 6)) # Adjust figure size for two panels
+
+                        # FIX: Set known colors for 'source_umap' in .uns for consistent plotting
                         source_categories = adata_combined_hvg.obs['source_umap'].cat.categories
-                        source_colors_map = {'Real': 'blue', f'Generated ({model_name})': 'red'}
-                        adata_combined_hvg.uns['source_umap_colors'] = [source_colors_map.get(cat, '#_DEFAULT_COLOR_') for cat in source_categories]
+                        source_colors_map = {'Real': '#1f77b4', f'Generated ({model_name})': '#ff7f0e'} # Matplotlib default colors
+                        adata_combined_hvg.uns['source_umap_colors'] = [source_colors_map.get(cat, '#808080') for cat in source_categories] # Grey for unknown
+
+                        # FIX: Provide a list of titles for each panel
+                        plot_titles = [f"UMAP: Source (Real vs. {model_name})", f"UMAP: Cell Types ({model_name})"]
 
                         sc.pl.umap(adata_combined_hvg, color=['source_umap', 'cell_type_str_umap'],
-                                   # palette=None, # Let Scanpy handle cell_type_str_umap palette or use .uns
                                    frameon=False, legend_fontsize=8, legend_loc='on data', show=False,
-                                   save=f"_figure2_umap_{model_name.replace(' ', '_')}.png",
-                                   title=f"UMAP of Real vs. Generated ({model_name})")
+                                   # FIX: Pass a list of titles
+                                   title=plot_titles,
+                                   # Scanpy saves with a default name, then we move it
+                                   save=f"_figure2_umap_{model_name.replace(' ', '_')}.png")
                         
-                        default_save_path = f"./figures/umap_figure2_umap_{model_name.replace(' ', '_')}.png"
+                        # FIX: Move the saved figure from scanpy's default location to output_dir
+                        default_save_path = f"figures/umap_figure2_umap_{model_name.replace(' ', '_')}.png"
                         target_save_path = os.path.join(output_dir, f"figure2_umap_comparison_{model_name.replace(' ', '_')}.png")
+                        
                         if os.path.exists(default_save_path):
                              os.rename(default_save_path, target_save_path)
                              print(f"Figure 2 UMAP saved to {target_save_path}")
+                             # Clean up the 'figures' directory if it's empty after moving
                              if os.path.exists("./figures") and not os.listdir("./figures"):
-                                 try: os.rmdir("./figures")
-                                 except OSError: pass 
-                        else: print(f"Warning: Scanpy UMAP plot not found at default location: {default_save_path}")
+                                 try:
+                                     os.rmdir("./figures")
+                                 except OSError:
+                                     # Directory might not be empty if other plots are saved there by scanpy
+                                     pass 
+                        else:
+                            print(f"Warning: Scanpy UMAP plot not found at default location: {default_save_path}")
                         plt.close()
             else: print("Skipping UMAP: No highly variable genes found or remaining.")
         else: print("Skipping UMAP: Combined AnnData has 0 genes or concatenation failed.")
@@ -1177,7 +1184,7 @@ if __name__ == '__main__':
     set_seed(GLOBAL_SEED)
 
     # Consider annealing KL weight: start small (e.g., 0 or 1e-4) and increase to target over epochs.
-    loss_weights = {'diff': 1.0, 'kl': 0.01, 'rec': 1.0} # Adjusted KL weight to be much lower, rec to 1.0
+    loss_weights = {'diff': 1.0, 'kl': 0.01, 'rec': 1.0} # Adjusted KL and Rec weights for NB
     INPUT_MASKING_FRACTION = 0.1 # Fraction of input genes to mask during training (0.0 to disable)
 
     TRAIN_H5AD = 'data/pbmc3k_train.h5ad'
@@ -1320,16 +1327,20 @@ if __name__ == '__main__':
                 if not filtered_gene_names_from_train:
                     print("Warning: 'filtered_gene_names_from_train' is empty. UMAP gene names might be incorrect.")
 
-                generate_qualitative_plots(
-                    real_adata_filtered=test_adata, # Pass the filtered real AnnData
-                    generated_counts=gen_counts,
-                    generated_cell_types=gen_types,
-                    train_cell_type_categories=current_train_cell_type_categories,
-                    train_filtered_gene_names=filtered_gene_names_from_train, # This should be available from training data loading
-                    output_dir=output_plot_dir,
-                    umap_neighbors=K_NEIGHBORS, # Use your global K_NEIGHBORS
-                    model_name="LapDDPM" # Your model's name
-                )
+                # Use the last generated dataset for plotting
+                if generated_datasets_counts and generated_datasets_counts[-1] is not None:
+                    generate_qualitative_plots(
+                        real_adata_filtered=test_adata, # Pass the filtered real AnnData
+                        generated_counts=generated_datasets_counts[-1],
+                        generated_cell_types=generated_datasets_cell_types[-1],
+                        train_cell_type_categories=current_train_cell_type_categories,
+                        train_filtered_gene_names=filtered_gene_names_from_train, # This should be available from training data loading
+                        output_dir=output_plot_dir,
+                        umap_neighbors=K_NEIGHBORS, # Use your global K_NEIGHBORS
+                        model_name="LapDDPM" # Your model's name
+                    )
+                else:
+                    print("Skipping qualitative plots: No valid generated data for plotting.")
                 # --- END OF QUALITATIVE PLOTTING ---
         else: print("\nSkipping final evaluation: Trainer not initialized.")
     else: print("\nSkipping final evaluation: Test data problematic or filtered genes unavailable.")

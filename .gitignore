@@ -12,6 +12,7 @@ __pycache__/
 *data/
 *data*/
 results/
+qualitative*/
 *.csv
 *delme/
 delme*
