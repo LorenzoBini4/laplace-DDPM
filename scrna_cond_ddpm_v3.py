@@ -1029,25 +1029,82 @@ def generate_qualitative_plots(real_adata_filtered, generated_counts, generated_
     else:
         print("Skipping Figure 1b: Real or generated data is empty.")
 
-    # --- Figure 2: UMAP Visualization (Corrected) ---
-    print("Plotting Figure 2: UMAP Visualization...")
-    if real_counts_np.shape[0] > 0 and generated_counts.shape[0] > 0:
-        adata_real_copy = real_adata_filtered.copy()
-        # Ensure 'source_umap' is categorical for Scanpy's color handling
-        adata_real_copy.obs['source_umap'] = pd.Categorical(['Real'] * adata_real_copy.shape[0])
-        
-        if 'cell_type' in adata_real_copy.obs:
-            if isinstance(adata_real_copy.obs['cell_type'].dtype, pd.CategoricalDtype):
-                 adata_real_copy.obs['cell_type_str_umap'] = adata_real_copy.obs['cell_type']
-            elif pd.api.types.is_numeric_dtype(adata_real_copy.obs['cell_type']): # Check if it's numeric type
-                adata_real_copy.obs['cell_type_str_umap'] = adata_real_copy.obs['cell_type'].apply(
+    # --- Figure 2: UMAP Visualization (Separate Plots for Real and Generated) ---
+    print("Plotting Figure 2: Separate UMAP Visualizations for Real and Generated Data...")
+
+    # --- Process Real Data for UMAP ---
+    if real_counts_np.shape[0] > 0 and real_counts_np.shape[1] > 0:
+        adata_real_processed = real_adata_filtered.copy()
+        adata_real_processed.var_names = [str(name) for name in adata_real_processed.var_names] # Ensure var_names are strings
+
+        if 'cell_type' in adata_real_processed.obs:
+            if isinstance(adata_real_processed.obs['cell_type'].dtype, pd.CategoricalDtype):
+                adata_real_processed.obs['cell_type_str_umap'] = adata_real_processed.obs['cell_type']
+            elif pd.api.types.is_numeric_dtype(adata_real_processed.obs['cell_type']):
+                adata_real_processed.obs['cell_type_str_umap'] = adata_real_processed.obs['cell_type'].apply(
                     lambda x: train_cell_type_categories[int(x)] if 0 <= int(x) < len(train_cell_type_categories) else f"UnknownReal_{int(x)}"
                 ).astype('category')
-            else: 
-                adata_real_copy.obs['cell_type_str_umap'] = adata_real_copy.obs['cell_type'].astype('category')
+            else:
+                adata_real_processed.obs['cell_type_str_umap'] = adata_real_processed.obs['cell_type'].astype('category')
         else:
-            adata_real_copy.obs['cell_type_str_umap'] = pd.Categorical(['Unknown_Real'] * adata_real_copy.shape[0])
+            adata_real_processed.obs['cell_type_str_umap'] = pd.Categorical(['Unknown_Real'] * adata_real_processed.shape[0])
 
+        # UMAP pipeline for real data
+        sc.pp.normalize_total(adata_real_processed, target_sum=1e4)
+        sc.pp.log1p(adata_real_processed)
+        
+        try:
+            n_top_genes_hvg_real = min(2000, adata_real_processed.shape[1] - 1 if adata_real_processed.shape[1] > 1 else 1)
+            if n_top_genes_hvg_real > 0:
+                print("Performing HVG selection for real data with flavor 'cell_ranger'.")
+                # FIX: Use 'cell_ranger' flavor for HVG, as it handles non-integer data after normalization/log1p
+                sc.pp.highly_variable_genes(adata_real_processed, n_top_genes=n_top_genes_hvg_real, flavor='cell_ranger')
+                adata_real_hvg = adata_real_processed[:, adata_real_processed.var.highly_variable].copy()
+            else:
+                print("Warning: Not enough genes for HVG selection in real data. Using all genes.")
+                adata_real_hvg = adata_real_processed.copy()
+        except Exception as e_hvg_real:
+            print(f"Error selecting HVGs for real data: {e_hvg_real}. Using all genes for PCA/UMAP.")
+            adata_real_hvg = adata_real_processed.copy()
+
+        if adata_real_hvg.shape[1] > 0:
+            n_comps_pca_real = min(50, adata_real_hvg.shape[0] - 1 if adata_real_hvg.shape[0] > 1 else 50,
+                                   adata_real_hvg.shape[1] - 1 if adata_real_hvg.shape[1] > 1 else 50)
+            if n_comps_pca_real < 2:
+                print(f"Warning: Not enough features/samples for PCA in real data ({n_comps_pca_real} components). Skipping UMAP for real data.")
+            else:
+                sc.pp.scale(adata_real_hvg, max_value=10)
+                sc.tl.pca(adata_real_hvg, svd_solver='arpack', n_comps=n_comps_pca_real)
+                current_umap_neighbors_real = min(umap_neighbors, adata_real_hvg.shape[0] - 1 if adata_real_hvg.shape[0] > 1 else umap_neighbors)
+                if current_umap_neighbors_real < 2:
+                    print(f"Warning: Not enough samples for UMAP neighbors in real data ({current_umap_neighbors_real}). Skipping UMAP for real data.")
+                else:
+                    sc.pp.neighbors(adata_real_hvg, n_neighbors=current_umap_neighbors_real, use_rep='X_pca')
+                    sc.tl.umap(adata_real_hvg, min_dist=0.3)
+                    
+                    # Plot Real Data UMAP
+                    plt.figure(figsize=(8, 8))
+                    sc.pl.umap(adata_real_hvg, color='cell_type_str_umap',
+                               frameon=False, legend_fontsize=8, legend_loc='on data', show=False,
+                               title=f"UMAP of Real Data Cell Types",
+                               save=f"_figure2_umap_real_{model_name.replace(' ', '_')}.png")
+                    
+                    default_save_path_real = f"figures/umap_figure2_umap_real_{model_name.replace(' ', '_')}.png"
+                    target_save_path_real = os.path.join(output_dir, f"figure2_umap_real_cell_types_{model_name.replace(' ', '_')}.png")
+                    if os.path.exists(default_save_path_real):
+                        os.rename(default_save_path_real, target_save_path_real)
+                        print(f"Figure 2 (Real Data UMAP) saved to {target_save_path_real}")
+                    else:
+                        print(f"Warning: Scanpy UMAP plot for real data not found at default location: {default_save_path_real}")
+                    plt.close()
+        else:
+            print("Skipping UMAP for real data: No highly variable genes found or remaining.")
+    else:
+        print("Skipping UMAP for real data: Real data is empty.")
+
+
+    # --- Process Generated Data for UMAP ---
+    if generated_counts.shape[0] > 0 and generated_counts.shape[1] > 0:
         gen_cell_type_str_list = [
             train_cell_type_categories[int(code)] if 0 <= int(code) < len(train_cell_type_categories) else f"UnknownGen_{int(code)}"
             for code in generated_cell_types
@@ -1055,119 +1112,83 @@ def generate_qualitative_plots(real_adata_filtered, generated_counts, generated_
         
         var_names_for_gen = [str(name) for name in train_filtered_gene_names]
         if not var_names_for_gen and generated_counts.shape[1] > 0:
+            print("Warning: No gene names for generated data, creating dummy names for UMAP.")
             var_names_for_gen = [f"Gene_{i}" for i in range(generated_counts.shape[1])]
-        
-        if not var_names_for_gen and generated_counts.shape[1] > 0 : # Still no var names but have genes
-             print("Warning: No gene names for generated data, creating dummy names for UMAP.")
-             var_names_for_gen = [f"gene_g_{i}" for i in range(generated_counts.shape[1])]
         elif generated_counts.shape[1] == 0:
-            print("Skipping UMAP: Generated counts have 0 genes.")
+            print("Skipping UMAP for generated data: Generated counts have 0 genes.")
             return # Exit plotting for UMAP if no genes
 
-
-        adata_gen = ad.AnnData(
+        adata_gen_processed = ad.AnnData(
             X=generated_counts,
             obs=pd.DataFrame({
-                'source_umap': pd.Categorical([f'Generated ({model_name})'] * generated_counts.shape[0]),
                 'cell_type_str_umap': pd.Categorical(gen_cell_type_str_list)
             }),
-            var=pd.DataFrame(index=var_names_for_gen) if var_names_for_gen else None
+            var=pd.DataFrame(index=var_names_for_gen)
         )
+        adata_gen_processed.var_names = [str(name) for name in adata_gen_processed.var_names] # Ensure var_names are strings
 
-        adata_real_copy.var_names = [str(name) for name in adata_real_copy.var_names]
-        adata_gen.var_names = [str(name) for name in adata_gen.var_names] # Ensure generated var_names are strings
+        # UMAP pipeline for generated data
+        sc.pp.normalize_total(adata_gen_processed, target_sum=1e4)
+        sc.pp.log1p(adata_gen_processed)
 
-        common_genes = list(set(adata_real_copy.var_names) & set(adata_gen.var_names))
-        if not common_genes:
-            print("Error: No common genes between real and generated AnnData for UMAP. Check gene name consistency. Skipping UMAP.")
-            adata_combined = None
-        else:
-            adata_real_for_concat = adata_real_copy[:, common_genes].copy()
-            adata_gen_for_concat = adata_gen[:, common_genes].copy()
-            try:
-                adata_combined = ad.concat(
-                    {"real": adata_real_for_concat, "generated": adata_gen_for_concat},
-                    join='outer', 
-                    label='batch_concat_label', 
-                    index_unique="-" # Add a suffix to make obs_names unique
-                )
-            except Exception as e_concat:
-                print(f"Error during AnnData concatenation for UMAP: {e_concat}. Skipping UMAP.")
-                adata_combined = None
+        try:
+            n_top_genes_hvg_gen = min(2000, adata_gen_processed.shape[1] - 1 if adata_gen_processed.shape[1] > 1 else 1)
+            if n_top_genes_hvg_gen > 0:
+                print("Performing HVG selection for generated data with flavor 'cell_ranger'.")
+                # FIX: Use 'cell_ranger' flavor for HVG
+                sc.pp.highly_variable_genes(adata_gen_processed, n_top_genes=n_top_genes_hvg_gen, flavor='cell_ranger')
+                adata_gen_hvg = adata_gen_processed[:, adata_gen_processed.var.highly_variable].copy()
+            else:
+                print("Warning: Not enough genes for HVG selection in generated data. Using all genes.")
+                adata_gen_hvg = adata_gen_processed.copy()
+        except Exception as e_hvg_gen:
+            print(f"Error selecting HVGs for generated data: {e_hvg_gen}. Using all genes for PCA/UMAP.")
+            adata_gen_hvg = adata_gen_processed.copy()
 
-        if adata_combined and adata_combined.shape[1] > 0:
-            print(f"Combined AnnData shape for UMAP: {adata_combined.shape}")
-            sc.pp.normalize_total(adata_combined, target_sum=1e4)
-            sc.pp.log1p(adata_combined)
-            
-            adata_combined_hvg = adata_combined 
-            try:
-                n_top_genes_hvg = min(2000, adata_combined.shape[1] -1 if adata_combined.shape[1] > 1 else 1)
-                if n_top_genes_hvg > 0:
-                    # FIX: Changed flavor to 'cell_ranger' as it's more robust to non-integer inputs after normalization/log1p
-                    print("Performing HVG selection with flavor 'cell_ranger'.")
-                    sc.pp.highly_variable_genes(adata_combined, n_top_genes=n_top_genes_hvg, flavor='cell_ranger', batch_key='source_umap')
-                    adata_combined_hvg = adata_combined[:, adata_combined.var.highly_variable].copy()
+        if adata_gen_hvg.shape[1] > 0:
+            n_comps_pca_gen = min(50, adata_gen_hvg.shape[0] - 1 if adata_gen_hvg.shape[0] > 1 else 50,
+                                  adata_gen_hvg.shape[1] - 1 if adata_gen_hvg.shape[1] > 1 else 50)
+            if n_comps_pca_gen < 2:
+                print(f"Warning: Not enough features/samples for PCA in generated data ({n_comps_pca_gen} components). Skipping UMAP for generated data.")
+            else:
+                sc.pp.scale(adata_gen_hvg, max_value=10)
+                sc.tl.pca(adata_gen_hvg, svd_solver='arpack', n_comps=n_comps_pca_gen)
+                current_umap_neighbors_gen = min(umap_neighbors, adata_gen_hvg.shape[0] - 1 if adata_gen_hvg.shape[0] > 1 else umap_neighbors)
+                if current_umap_neighbors_gen < 2:
+                    print(f"Warning: Not enough samples for UMAP neighbors in generated data ({current_umap_neighbors_gen}). Skipping UMAP for generated data.")
                 else:
-                    print("Warning: Not enough genes for HVG selection. Using all genes.")
-            except Exception as e_hvg: # Catch any error during HVG
-                 print(f"Error selecting HVGs: {e_hvg}. Using all genes for PCA/UMAP.")
-                 adata_combined_hvg = adata_combined.copy()
+                    sc.pp.neighbors(adata_gen_hvg, n_neighbors=current_umap_neighbors_gen, use_rep='X_pca')
+                    sc.tl.umap(adata_gen_hvg, min_dist=0.3)
 
-
-            if adata_combined_hvg.shape[1] > 0:
-                n_comps_pca = min(50, adata_combined_hvg.shape[0] - 1 if adata_combined_hvg.shape[0] > 1 else 50, 
-                                      adata_combined_hvg.shape[1] - 1 if adata_combined_hvg.shape[1] > 1 else 50)
-                if n_comps_pca < 2 : 
-                    print(f"Warning: Not enough features/samples for PCA ({n_comps_pca} components). Skipping UMAP.")
-                else:
-                    sc.pp.scale(adata_combined_hvg, max_value=10) 
-                    sc.tl.pca(adata_combined_hvg, svd_solver='arpack', n_comps=n_comps_pca)
-                    current_umap_neighbors = min(umap_neighbors, adata_combined_hvg.shape[0] - 1 if adata_combined_hvg.shape[0] > 1 else umap_neighbors)
-                    if current_umap_neighbors < 2: 
-                        print(f"Warning: Not enough samples for UMAP neighbors ({current_umap_neighbors}). Skipping UMAP.")
+                    # Plot Generated Data UMAP
+                    plt.figure(figsize=(8, 8))
+                    sc.pl.umap(adata_gen_hvg, color='cell_type_str_umap',
+                               frameon=False, legend_fontsize=8, legend_loc='on data', show=False,
+                               title=f"UMAP of Generated ({model_name}) Cell Types",
+                               save=f"_figure2_umap_gen_{model_name.replace(' ', '_')}.png")
+                    
+                    default_save_path_gen = f"figures/umap_figure2_umap_gen_{model_name.replace(' ', '_')}.png"
+                    target_save_path_gen = os.path.join(output_dir, f"figure2_umap_generated_cell_types_{model_name.replace(' ', '_')}.png")
+                    if os.path.exists(default_save_path_gen):
+                        os.rename(default_save_path_gen, target_save_path_gen)
+                        print(f"Figure 2 (Generated Data UMAP) saved to {target_save_path_gen}")
                     else:
-                        sc.pp.neighbors(adata_combined_hvg, n_neighbors=current_umap_neighbors, use_rep='X_pca')
-                        sc.tl.umap(adata_combined_hvg, min_dist=0.3)
-                        
-                        plt.figure(figsize=(12, 6)) # Adjust figure size for two panels
+                        print(f"Warning: Scanpy UMAP plot for generated data not found at default location: {default_save_path_gen}")
+                    plt.close()
+        else:
+            print("Skipping UMAP for generated data: No highly variable genes found or remaining.")
+    else:
+        print("Skipping UMAP for generated data: Generated data is empty.")
 
-                        # FIX: Set known colors for 'source_umap' in .uns for consistent plotting
-                        source_categories = adata_combined_hvg.obs['source_umap'].cat.categories
-                        source_colors_map = {'Real': '#1f77b4', f'Generated ({model_name})': '#ff7f0e'} # Matplotlib default colors
-                        adata_combined_hvg.uns['source_umap_colors'] = [source_colors_map.get(cat, '#808080') for cat in source_categories] # Grey for unknown
-
-                        # FIX: Provide a list of titles for each panel
-                        plot_titles = [f"UMAP: Source (Real vs. {model_name})", f"UMAP: Cell Types ({model_name})"]
-
-                        sc.pl.umap(adata_combined_hvg, color=['source_umap', 'cell_type_str_umap'],
-                                   frameon=False, legend_fontsize=8, legend_loc='on data', show=False,
-                                   # FIX: Pass a list of titles
-                                   title=plot_titles,
-                                   # Scanpy saves with a default name, then we move it
-                                   save=f"_figure2_umap_{model_name.replace(' ', '_')}.png")
-                        
-                        # FIX: Move the saved figure from scanpy's default location to output_dir
-                        default_save_path = f"figures/umap_figure2_umap_{model_name.replace(' ', '_')}.png"
-                        target_save_path = os.path.join(output_dir, f"figure2_umap_comparison_{model_name.replace(' ', '_')}.png")
-                        
-                        if os.path.exists(default_save_path):
-                             os.rename(default_save_path, target_save_path)
-                             print(f"Figure 2 UMAP saved to {target_save_path}")
-                             # Clean up the 'figures' directory if it's empty after moving
-                             if os.path.exists("./figures") and not os.listdir("./figures"):
-                                 try:
-                                     os.rmdir("./figures")
-                                 except OSError:
-                                     # Directory might not be empty if other plots are saved there by scanpy
-                                     pass 
-                        else:
-                            print(f"Warning: Scanpy UMAP plot not found at default location: {default_save_path}")
-                        plt.close()
-            else: print("Skipping UMAP: No highly variable genes found or remaining.")
-        else: print("Skipping UMAP: Combined AnnData has 0 genes or concatenation failed.")
-    else: print("Skipping Figure 2 (UMAP): Real or generated data is empty.")
+    # Clean up the 'figures' directory if it's empty after moving
+    if os.path.exists("./figures") and not os.listdir("./figures"):
+        try:
+            os.rmdir("./figures")
+        except OSError:
+            pass # Directory might not be empty if other plots are saved there by scanpy
+            
     print(f"Qualitative plotting for {model_name} finished.")
+
 
 if __name__ == '__main__':
     BATCH_SIZE = 64 # For DataLoader, but PBMC3KDataset is InMemory, so effectively 1 batch of the whole graph
