@@ -747,7 +747,9 @@ class Trainer:
                     # Negative Binomial distribution parameterized by total_count (dispersion) and probs
                     # total_count is often denoted as 'r' or 'k'
                     # probs = mean / (mean + total_count)
-                    nb_dist = dist.NegativeBinomial(total_count=theta_rec, probs=mu_rec / (mu_rec + theta_rec))
+                    probs_rec = mu_rec / (mu_rec + theta_rec)
+                    probs_rec = torch.clamp(probs_rec, min=1e-6, max=1 - 1e-6)  # Clamp to (0, 1)
+                    nb_dist = dist.NegativeBinomial(total_count=theta_rec, probs=probs_rec)
                     loss_rec = -nb_dist.log_prob(target_counts).mean() # Negative log-likelihood
 
                 final_loss = (self.loss_weights.get('diff', 1.0) * loss_diff +
@@ -1195,9 +1197,9 @@ if __name__ == '__main__':
     LEARNING_RATE = 1e-3
     EPOCHS = 1500 # Reduced epochs as a starting point for testing
     HIDDEN_DIM = 1024
-    LATENT_DIM = 512
-    PE_DIM = 20
-    K_NEIGHBORS = 20
+    LATENT_DIM = 1024
+    PE_DIM = 50
+    K_NEIGHBORS = 50
     PCA_NEIGHBORS = 50
     GENE_THRESHOLD = 20
     TIMESTEPS_DIFFUSION = 1000
@@ -1205,7 +1207,7 @@ if __name__ == '__main__':
     set_seed(GLOBAL_SEED)
 
     # Consider annealing KL weight: start small (e.g., 0 or 1e-4) and increase to target over epochs.
-    loss_weights = {'diff': 1.0, 'kl': 0.01, 'rec': 1.0} # Adjusted KL and Rec weights for NB
+    loss_weights = {'diff': 10.0, 'kl': 0.005, 'rec': 20.0} # Adjusted KL weight
     INPUT_MASKING_FRACTION = 0.1 # Fraction of input genes to mask during training (0.0 to disable)
 
     TRAIN_H5AD = 'data/pbmc3k_train.h5ad'
@@ -1337,6 +1339,7 @@ if __name__ == '__main__':
                     else: averaged_metrics["MMD_Averages"][f'Avg_Scale_{scale}'] = np.nan
                 if all_wasserstein_results: averaged_metrics["Wasserstein_Average"] = np.mean(all_wasserstein_results)
                 print(averaged_metrics)
+                
                 # --- >>> QUALITATIVE PLOTTING  <<< ---
                 output_plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qualitative_evaluation_plots_v2")
                 current_train_cell_type_categories = ["Unknown"] # Default

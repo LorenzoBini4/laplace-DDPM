@@ -1132,8 +1132,8 @@ if __name__ == '__main__':
     BATCH_SIZE = 64 # For DataLoader, but PBMC3KDataset is InMemory, so effectively 1 batch of the whole graph
     LEARNING_RATE = 1e-3
     EPOCHS = 1500 # Reduced epochs as a starting point for testing
-    HIDDEN_DIM = 1024
-    LATENT_DIM = 512
+    HIDDEN_DIM = 2048
+    LATENT_DIM = 1024
     PE_DIM = 20
     K_NEIGHBORS = 20
     PCA_NEIGHBORS = 50
@@ -1143,7 +1143,7 @@ if __name__ == '__main__':
     set_seed(GLOBAL_SEED)
 
     # Consider annealing KL weight: start small (e.g., 0 or 1e-4) and increase to target over epochs.
-    loss_weights = {'diff': 1.0, 'kl': 0.5, 'rec': 10.0} # Adjusted KL weight
+    loss_weights = {'diff': 1.0, 'kl': 0.0005, 'rec': 10.0} # Adjusted KL weight
     INPUT_MASKING_FRACTION = 0.3 # Fraction of input genes to mask during training (0.0 to disable)
 
     TRAIN_H5AD = 'data/pbmc3k_train.h5ad'
