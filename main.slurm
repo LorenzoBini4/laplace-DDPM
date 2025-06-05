@@ -7,6 +7,7 @@
 #SBATCH --output run_ddpm_v3.%j.out      # optional. By default the error and output files are merged
 #SBATCH --gres=gpu:1
 #SBATCH --time 0-04:14:59                  # maximum run time.
+#SBATCH --nodelist=kmer
 
 ## USED Python 3.8.18
 source $HOME/.bashrc
