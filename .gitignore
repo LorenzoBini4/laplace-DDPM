@@ -1,5 +1,6 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
+v0/*
 adv_cond_lap_ddpm.py
 cond_lap_ddpm.py
 lap_ddpm.py
