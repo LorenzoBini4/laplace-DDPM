@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 from torch_scatter import scatter_add, scatter_mean
 import torch.nn.functional as F
-from torch_geometric.data import InMemoryDataset, Data
 from torch_geometric.loader import NeighborLoader
 from torch_geometric.loader import DataLoader
 import pandas as pd
@@ -10,16 +9,17 @@ import numpy as np
 from sklearn.neighbors import NearestNeighbors
 import scipy.sparse as sp
 from scipy.sparse.linalg import eigsh
-from torch_geometric.nn import ChebConv
-import torch_geometric.utils
 import os
 import traceback
 import scanpy as sc
-import anndata as ad
 from sklearn.decomposition import PCA
 from scipy.spatial.distance import cdist # For pairwise distances in Wasserstein and MMD
 import sys # For checking installed modules
-import random
+from denta.dataset import *
+from denta.models import SpectralEncoder, ScoreNet, FeatureDecoder, ScoreSDE, LaplacianPerturb
+from denta.models import *
+from denta.seed import *        
+from denta.utils import *
 # Check for required libraries
 try:
     import torch
@@ -27,10 +27,6 @@ try:
     import torch_scatter
     import scanpy
     import anndata
-    import pandas
-    import numpy
-    import sklearn
-    import scipy
     import ot # Python Optimal Transport library
 except ImportError as e:
     print(f"Missing required library: {e}. Please install it using pip.")
@@ -38,7 +34,7 @@ except ImportError as e:
     sys.exit("Required libraries not found.")
 
 torch.backends.cudnn.benchmark = True
-# Attempt to set device, fall back to CPU if CUDA is not available or fails
+# attempt to set device, fall back to CPU if CUDA is not available or fails
 try:
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 except Exception as e:
@@ -47,534 +43,11 @@ except Exception as e:
 
 print(f"Using device: {device}")
 
-def set_seed(seed):
-    """Set random seeds for reproducibility."""
-    if seed is not None:
-        print(f"Setting random seed to {seed}")
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
-
-# Helper function for Laplacian PE
-def compute_lap_pe(edge_index, num_nodes, k=10):
-    """
-    Computes Laplacian Positional Encoding for a graph.
-    Args:
-        edge_index (torch.Tensor): Graph connectivity in COO format.
-        num_nodes (int): Number of nodes in the graph.
-        k (int): Number of eigenvectors to compute for the PE.
-    Returns:
-        torch.Tensor: Laplacian PE of shape (num_nodes, k).
-    """
-    target_device = edge_index.device if edge_index.numel() > 0 else torch.device('cpu')
-    if num_nodes == 0: return torch.zeros((0, k), device=target_device, dtype=torch.float)
-    if edge_index.numel() == 0:
-        return torch.zeros((num_nodes, k), device=target_device, dtype=torch.float)
-
-    edge_index_np = edge_index.cpu().numpy()
-    if edge_index_np.max() >= num_nodes or edge_index_np.min() < 0:
-         print(f"Warning: Edge index out of bounds ({edge_index_np.min()},{edge_index_np.max()}). Num nodes: {num_nodes}. Clamping.")
-         edge_index_np = np.clip(edge_index_np, 0, num_nodes - 1)
-         valid_edges_mask = edge_index_np[0] != edge_index_np[1]
-         edge_index_np = edge_index_np[:, valid_edges_mask]
-         if edge_index_np.size == 0:
-              print("Warning: All edges removed after clamping. Returning zero PEs.")
-              return torch.zeros((num_nodes, k), device=target_device, dtype=torch.float)
-
-    data_np = np.ones(edge_index_np.shape[1])
-    try:
-        row, col = edge_index_np
-        adj = sp.coo_matrix((data_np, (row, col)), shape=(num_nodes, num_nodes), dtype=np.float32)
-    except Exception as e:
-        print(f"Error creating sparse adj matrix for PE: {e}"); return torch.zeros((num_nodes, k), device=target_device, dtype=torch.float)
-
-    adj = adj + adj.T
-    adj.data[adj.data > 1] = 1
-
-    deg = np.array(adj.sum(axis=1)).flatten()
-    deg_inv_sqrt = 1.0 / np.sqrt(np.maximum(deg, 1e-12))
-    deg_inv_sqrt_mat = sp.diags(deg_inv_sqrt)
-    L = sp.eye(num_nodes, dtype=np.float32) - deg_inv_sqrt_mat @ adj @ deg_inv_sqrt_mat
-
-    num_eigenvectors_to_compute = min(k + 1, num_nodes)
-    if num_eigenvectors_to_compute <= 1:
-        return torch.zeros((num_nodes, k), device=target_device, dtype=torch.float)
-
-    try:
-        eigvals, eigvecs = eigsh(L, k=num_eigenvectors_to_compute, which='SM', tol=1e-4,
-                                 ncv=min(num_nodes, max(2 * num_eigenvectors_to_compute + 1, 20)))
-        sorted_indices = np.argsort(eigvals)
-        eigvecs = eigvecs[:, sorted_indices]
-    except Exception as e:
-        print(f"Eigenvalue computation failed for PE ({num_nodes} nodes, k={num_eigenvectors_to_compute}): {e}. Returning zero PEs.");
-        traceback.print_exc()
-        return torch.zeros((num_nodes, k), device=target_device, dtype=torch.float)
-
-    start_idx = 1 if eigvecs.shape[1] > 1 else 0
-    actual_k_to_use = min(k, eigvecs.shape[1] - start_idx)
-
-    if actual_k_to_use <= 0:
-        pe = torch.zeros((num_nodes, k), dtype=torch.float)
-    else:
-        pe = torch.from_numpy(eigvecs[:, start_idx : start_idx + actual_k_to_use]).float()
-        if pe.shape[1] < k:
-            padding = torch.zeros((num_nodes, k - pe.shape[1]), dtype=torch.float)
-            pe = torch.cat((pe, padding), dim=1)
-    return pe.to(target_device)
-
-
-class PBMC3KDataset(InMemoryDataset):
-    def __init__(self, h5ad_path, k_neighbors=15, pe_dim=10, root='data/pbmc3k', train=True, gene_threshold=20, pca_neighbors=50):
-        self.h5ad_path = h5ad_path
-        self.k_neighbors = k_neighbors
-        self.pe_dim = pe_dim
-        self.train = train
-        self.gene_threshold = gene_threshold
-        self.pca_neighbors = pca_neighbors
-        self.filtered_gene_names = []
-
-        processed_file = f'pbmc3k_{"train" if train else "test"}_k{k_neighbors}_pe{pe_dim}_gt{gene_threshold}_pca{pca_neighbors}.pt'
-        self.processed_file_names_list = [processed_file]
-        super().__init__(root=root, transform=None, pre_transform=None)
-
-        if not os.path.exists(self.processed_paths[0]):
-            print(f"Processed file not found at {self.processed_paths[0]}. Dataset will be processed.")
-            self.process()
-        try:
-            self.data, self.slices = torch.load(self.processed_paths[0])
-            print(f"Successfully loaded processed data from {self.processed_paths[0]}")
-            if self.data is None or self.data.num_nodes == 0:
-                 print("Warning: Loaded processed data is empty or has no nodes.")
-        except Exception as e:
-            print(f"Error loading processed data from {self.processed_paths[0]}: {e}. Attempting to re-process.")
-            traceback.print_exc()
-            if os.path.exists(self.processed_paths[0]):
-                 os.remove(self.processed_paths[0])
-            self.process()
-
-    @property
-    def raw_file_names(self):
-        return [os.path.basename(self.h5ad_path)]
-
-    @property
-    def processed_file_names(self):
-        return self.processed_file_names_list
-
-    def download(self):
-        if not os.path.exists(self.h5ad_path):
-            print(f"FATAL ERROR: H5AD file not found at {self.h5ad_path}");
-            raise FileNotFoundError(f"H5AD file not found: {self.h5ad_path}")
-        pass
-
-    def process(self):
-        print(f"Processing data from H5AD: {self.h5ad_path} for {'train' if self.train else 'test'} set.")
-        print(f"Parameters: k={self.k_neighbors}, PE_dim={self.pe_dim}, Gene Threshold={self.gene_threshold}, PCA Neighbors={self.pca_neighbors}")
-
-        try:
-            adata = sc.read_h5ad(self.h5ad_path)
-            if not isinstance(adata.X, (np.ndarray, sp.spmatrix)):
-                 print(f"Warning: adata.X is of type {type(adata.X)}. Attempting conversion.")
-                 try:
-                     adata.X = sp.csr_matrix(adata.X)
-                 except Exception as e:
-                     print(f"Could not convert adata.X: {e}")
-                     try:
-                         adata.X = np.array(adata.X)
-                     except Exception as e_dense:
-                         print(f"FATAL ERROR: Could not convert adata.X to sparse or dense: {e_dense}"); raise e_dense
-        except FileNotFoundError:
-            print(f"FATAL ERROR: H5AD file not found at {self.h5ad_path}"); raise
-        except Exception as e:
-            print(f"FATAL ERROR reading H5AD file {self.h5ad_path}: {e}"); traceback.print_exc(); raise
-
-        counts = adata.X
-        num_cells, initial_num_genes = counts.shape
-        print(f"Initial data shape: {num_cells} cells, {initial_num_genes} genes.")
-
-        if num_cells == 0 or initial_num_genes == 0:
-             print("Warning: Input data is empty. Creating empty Data object.")
-             data = Data(
-                    x=torch.empty((0, 0), dtype=torch.float), # Ensure x is empty tensor
-                    edge_index=torch.empty((2,0), dtype=torch.long), # Ensure edge_index is empty tensor
-                    lap_pe=torch.empty((0, self.pe_dim), dtype=torch.float), # Ensure lap_pe is empty tensor
-                    cell_type=torch.empty(0, dtype=torch.long), # Ensure cell_type is empty tensor
-                    num_nodes=num_cells,
-                    time=torch.zeros(num_cells, dtype=torch.long),  # Added 'time' attribute for neighbor loader
-                )
-             data_list = [data]
-             data_to_save, slices_to_save = self.collate(data_list)
-             torch.save((data_to_save, slices_to_save), self.processed_paths[0])
-             print(f"Processed and saved empty data to {self.processed_paths[0]}")
-             return
-
-        print(f"Filtering genes expressed in fewer than {self.gene_threshold} cells.")
-        if sp.issparse(counts):
-            genes_expressed_count = np.asarray((counts > 0).sum(axis=0)).flatten()
-            genes_to_keep_mask = genes_expressed_count >= self.gene_threshold
-            counts = counts[:, genes_to_keep_mask]
-            self.filtered_gene_names = adata.var_names[genes_to_keep_mask].tolist()
-        else:
-            genes_expressed_count = np.count_nonzero(counts, axis=0)
-            genes_to_keep_mask = genes_expressed_count >= self.gene_threshold
-            counts = counts[:, genes_to_keep_mask]
-            if hasattr(adata, 'var_names') and adata.var_names is not None and len(adata.var_names) == initial_num_genes:
-                 self.filtered_gene_names = [adata.var_names[i] for i, keep in enumerate(genes_to_keep_mask) if keep]
-            else:
-                 print("Warning: Could not retrieve gene names from adata.var_names for filtered genes.")
-                 self.filtered_gene_names = [f'gene_{i}' for i in np.where(genes_to_keep_mask)[0]]
-
-        num_genes_after_filtering = counts.shape[1]
-        print(f"Number of genes after filtering: {num_genes_after_filtering}")
-
-        if num_genes_after_filtering == 0:
-            print("FATAL ERROR: All genes filtered out. Creating empty Data object.")
-            self.filtered_gene_names = []
-            data = Data(x=torch.empty((num_cells, 0), dtype=torch.float),
-                        edge_index=torch.empty((2,0), dtype=torch.long),
-                        cell_type=torch.empty(num_cells, dtype=torch.long),
-                        lap_pe=torch.empty((num_cells, self.pe_dim), dtype=torch.float),
-                        num_nodes=num_cells)
-            data_list = [data]
-            data_to_save, slices_to_save = self.collate(data_list)
-            torch.save((data_to_save, slices_to_save), self.processed_paths[0])
-            print(f"Processed and saved empty data to {self.processed_paths[0]}")
-            return
-
-        if 'cell_type' not in adata.obs.columns:
-             print("Warning: 'cell_type' not found in adata.obs.columns. Proceeding without cell type labels.")
-             cell_type_labels = np.zeros(num_cells, dtype=int)
-             num_cell_types = 1
-             cell_type_categories = ["Unknown"]
-        else:
-            cell_type_series = adata.obs['cell_type']
-            if not pd.api.types.is_categorical_dtype(cell_type_series):
-                 try:
-                     cell_type_series = cell_type_series.astype('category')
-                 except Exception as e:
-                      print(f"Error converting cell_type to categorical: {e}. Using raw values.")
-                      try:
-                           unique_types, cell_type_labels = np.unique(cell_type_series.values, return_inverse=True)
-                           num_cell_types = len(unique_types)
-                           cell_type_categories = unique_types.tolist()
-                           print(f"Found {num_cell_types} cell types (processed as inverse indices).")
-                      except Exception as e_inv:
-                           print(f"FATAL ERROR: Could not process cell types as categorical or inverse indices: {e_inv}"); traceback.print_exc(); raise e_inv
-            else:
-                cell_type_labels = cell_type_series.cat.codes.values
-                num_cell_types = len(cell_type_series.cat.categories)
-                cell_type_categories = cell_type_series.cat.categories.tolist()
-                print(f"Found {num_cell_types} cell types.")
-
-        self.num_cell_types = num_cell_types
-        self.cell_type_categories = cell_type_categories
-
-        edge_index = torch.empty((2,0), dtype=torch.long)
-        lap_pe = torch.zeros((num_cells, self.pe_dim), dtype=torch.float)
-
-        if num_cells > 1 and self.k_neighbors > 0 and num_genes_after_filtering > 0:
-            actual_k_for_knn = min(self.k_neighbors, num_cells - 1)
-            print(f"Building KNN graph with k={actual_k_for_knn} on {num_cells} cells based on PCA-reduced expression.")
-            pca_input = counts
-            if sp.issparse(pca_input):
-                try:
-                    print("Converting sparse counts to dense for PCA.")
-                    pca_input_dense = pca_input.toarray()
-                except Exception as e:
-                     print(f"Error converting sparse to dense for PCA: {e}. Using raw counts for KNN."); traceback.print_exc()
-                     pca_input_dense = counts # Fallback, might fail if still sparse
-            else:
-                 pca_input_dense = pca_input
-
-            pca_coords = None
-            if num_cells > 1 and pca_input_dense.shape[1] > 0:
-                 n_components_pca = min(self.pca_neighbors, pca_input_dense.shape[0] - 1, pca_input_dense.shape[1])
-                 if n_components_pca > 0:
-                     try:
-                         pca = PCA(n_components=n_components_pca, random_state=0)
-                         pca_coords = pca.fit_transform(pca_input_dense)
-                         print(f"PCA reduced data shape: {pca_coords.shape}")
-                     except Exception as e:
-                         print(f"Error during PCA for KNN graph: {e}. Using raw counts for KNN."); traceback.print_exc()
-                         pca_coords = pca_input_dense
-                 else:
-                      print("Warning: PCA components <= 0. Using raw counts for KNN.")
-                      pca_coords = pca_input_dense
-            else:
-                 print("Warning: Cannot perform PCA or KNN. Insufficient cells or features.")
-
-            knn_input_coords = pca_coords if pca_coords is not None else pca_input_dense
-            if knn_input_coords is not None and knn_input_coords.shape[0] > 1 and actual_k_for_knn > 0 and knn_input_coords.shape[1] > 0:
-                try:
-                    nbrs = NearestNeighbors(n_neighbors=actual_k_for_knn + 1, algorithm='auto', metric='euclidean').fit(knn_input_coords)
-                    distances, indices = nbrs.kneighbors(knn_input_coords)
-                    source_nodes = np.repeat(np.arange(num_cells), actual_k_for_knn)
-                    target_nodes = indices[:, 1:].flatten()
-                    edges = np.stack([source_nodes, target_nodes], axis=0)
-                    edge_index = torch.tensor(edges, dtype=torch.long)
-                    edge_index = torch_geometric.utils.to_undirected(edge_index, num_nodes=num_cells)
-                    edge_index, _ = torch_geometric.utils.remove_self_loops(edge_index)
-                    print(f"KNN graph built with {edge_index.size(1)} edges.")
-                except Exception as e:
-                    print(f"Error during KNN graph construction: {e}. Creating empty graph."); traceback.print_exc()
-                    edge_index = torch.empty((2,0), dtype=torch.long)
-            else:
-                 print("Warning: Cannot build KNN graph. Creating empty graph.")
-                 edge_index = torch.empty((2,0), dtype=torch.long)
-
-            if num_cells > 0 and edge_index.numel() > 0:
-                 print(f"Computing Laplacian PE with dim {self.pe_dim} for {num_cells} nodes.")
-                 try:
-                     lap_pe = compute_lap_pe(edge_index.cpu(), num_cells, k=self.pe_dim).to(device)
-                     lap_pe = lap_pe.to(torch.float32)
-                 except Exception as e:
-                      print(f"Error computing Laplacian PE: {e}. Returning zero PEs."); traceback.print_exc()
-                      lap_pe = torch.zeros((num_cells, self.pe_dim), device=device, dtype=torch.float32)
-            else:
-                 print("Skipping Laplacian PE computation.")
-                 lap_pe = torch.zeros((num_cells, self.pe_dim), device=device, dtype=torch.float32)
-
-        if sp.issparse(counts):
-            x = torch.from_numpy(counts.toarray().copy()).float()
-        else:
-            x = torch.from_numpy(counts.copy()).float()
-        cell_type = torch.from_numpy(cell_type_labels.copy()).long()
-        data = Data(x=x, edge_index=edge_index, lap_pe=lap_pe, cell_type=cell_type, num_nodes=num_cells)
-
-        if data.x.size(0) != num_cells: print(f"Warning: Data.x size mismatch.")
-        if data.lap_pe.size(0) != num_cells: print(f"Warning: Data.lap_pe size mismatch.")
-        if data.cell_type.size(0) != num_cells: print(f"Warning: Data.cell_type size mismatch.")
-        if data.edge_index.numel() > 0 and data.edge_index.max() >= num_cells: print(f"Warning: Edge index out of bounds.")
-
-        data_list = [data]
-        try:
-            data_to_save, slices_to_save = self.collate(data_list)
-            torch.save((data_to_save, slices_to_save), self.processed_paths[0])
-            print(f"Processed and saved data to {self.processed_paths[0]}")
-        except Exception as e:
-            print(f"FATAL ERROR saving processed data to {self.processed_paths[0]}: {e}"); traceback.print_exc()
-            if os.path.exists(self.processed_paths[0]): os.remove(self.processed_paths[0])
-            raise
-
-class LaplacianPerturb:
-    def __init__(self, alpha_min=1e-3, alpha_max=1e-2):
-        self.alpha_min = alpha_min
-        self.alpha_max = alpha_max
-
-    def sample(self, edge_index, num_nodes):
-        current_device = edge_index.device if edge_index.numel() > 0 else device
-        if edge_index.numel() == 0: return torch.empty((0,), device=current_device)
-        alpha = torch.rand(1, device=current_device, dtype=torch.float32) * (self.alpha_max - self.alpha_min) + self.alpha_min
-        signs = torch.randint(0, 2, (edge_index.size(1),), device=current_device, dtype=torch.float32) * 2.0 - 1.0
-        return 1.0 + alpha * signs
-
-    def adversarial(self, model_not_used, x, edge_index, current_weights, xi=1e-6, epsilon=0.1, ip=3):
-        num_nodes = x.size(0)
-        current_device = x.device
-        if num_nodes == 0 or edge_index.numel() == 0 or current_weights is None or current_weights.numel() == 0:
-            return current_weights.clone() if current_weights is not None else None
-
-        current_weights = torch.relu(current_weights) + 1e-8
-        if edge_index.max() >= num_nodes or edge_index.min() < 0:
-             print(f"Warning: Edge index out of bounds for adversarial perturbation. Skipping.")
-             return current_weights.clone()
-
-        adj = torch.sparse_coo_tensor(edge_index, current_weights.float(), (num_nodes, num_nodes), device=current_device).coalesce()
-        perturbed_weights = current_weights.clone()
-        with torch.no_grad():
-            v = torch.randn(num_nodes, 1, device=current_device, dtype=x.dtype) * 0.01
-            v = v / (v.norm() + 1e-8)
-            for _ in range(ip):
-                v_new = torch.sparse.mm(adj, v)
-                v_norm = v_new.norm()
-                if v_norm > 1e-9: v = v_new / v_norm
-                else: v = torch.randn(num_nodes, 1, device=current_device, dtype=x.dtype) * 0.01; v = v / (v.norm() + 1e-8)
-
-            if edge_index.size(1) == 0:
-                edge_specific_perturbation_term = torch.empty(0, device=current_device, dtype=x.dtype)
-            else:
-                 v_i = v[edge_index[0]]
-                 v_j = v[edge_index[1]]
-                 edge_specific_perturbation_term = xi * v_i.squeeze(-1) * v_j.squeeze(-1)
-                 if edge_specific_perturbation_term.shape != current_weights.shape:
-                     print(f"Warning: Shape mismatch in adversarial perturbation. Skipping.")
-                     return current_weights.clone()
-            perturbed_weights = current_weights + epsilon * edge_specific_perturbation_term
-        return perturbed_weights.clamp(min=1e-4, max=10.0)
-
-class SpectralEncoder(nn.Module):
-    def __init__(self, in_dim, hid_dim, lat_dim, pe_dim):
-        super().__init__()
-        self.pe_dim = pe_dim
-        self.cheb1 = ChebConv(in_dim + pe_dim, hid_dim, K=4)
-        self.cheb2 = ChebConv(hid_dim, hid_dim, K=4)
-        self.mu_net = nn.Linear(hid_dim, lat_dim)
-        self.logvar_net = nn.Linear(hid_dim, lat_dim)
-
-    def forward(self, x, edge_index, lap_pe, edge_weight=None):
-        current_device = x.device
-        num_nodes = x.size(0)
-        if num_nodes == 0:
-             return torch.empty(0, self.mu_net.out_features, device=current_device, dtype=x.dtype), \
-                    torch.empty(0, self.logvar_net.out_features, device=current_device, dtype=x.dtype)
-
-        if lap_pe is None or lap_pe.size(0) != num_nodes or lap_pe.size(1) != self.pe_dim:
-            lap_pe = torch.zeros(num_nodes, self.pe_dim, device=current_device, dtype=x.dtype)
-        x_combined = torch.cat([x, lap_pe], dim=1)
-
-        edge_index_sl, edge_weight_sl = edge_index, edge_weight
-        if edge_index.numel() > 0:
-            edge_index_sl, edge_weight_sl = torch_geometric.utils.add_self_loops(edge_index, edge_weight, num_nodes=num_nodes, fill_value=1.0)
-        elif num_nodes > 0:
-             edge_index_sl = torch.arange(num_nodes, device=current_device).repeat(2, 1)
-             edge_weight_sl = torch.ones(num_nodes, device=current_device, dtype=x.dtype)
-        else:
-             edge_index_sl = torch.empty((2,0), dtype=torch.long, device=current_device)
-             edge_weight_sl = None
-
-        if edge_weight_sl is not None:
-             if edge_weight_sl.device != current_device: edge_weight_sl = edge_weight_sl.to(current_device)
-             if edge_weight_sl.dtype != x_combined.dtype: edge_weight_sl = edge_weight_sl.to(x_combined.dtype)
-
-        h = F.relu(self.cheb1(x_combined, edge_index_sl, edge_weight_sl))
-        h = F.relu(self.cheb2(h, edge_index_sl, edge_weight_sl))
-        mu = self.mu_net(h)
-        logvar = self.logvar_net(h)
-        return mu, logvar
-
-class ScoreNet(nn.Module):
-    def __init__(self, lat_dim, num_cell_types, time_embed_dim=32, hid_dim_mlp=512): # Added hid_dim_mlp
-        super().__init__()
-        self.lat_dim = lat_dim
-        self.num_cell_types = num_cell_types
-        self.time_embed_dim = time_embed_dim
-
-        self.time_mlp = nn.Sequential(
-            nn.Linear(1, time_embed_dim),
-            nn.ReLU(),
-            nn.Linear(time_embed_dim, time_embed_dim)
-        )
-        self.cell_type_embed = nn.Embedding(num_cell_types, time_embed_dim)
-
-        # MLP with LayerNorm
-        self.mlp = nn.Sequential(
-            nn.Linear(lat_dim + time_embed_dim + time_embed_dim, hid_dim_mlp),
-            nn.LayerNorm(hid_dim_mlp), # Added LayerNorm
-            nn.ReLU(),
-            nn.Linear(hid_dim_mlp, hid_dim_mlp),
-            nn.LayerNorm(hid_dim_mlp), # Added LayerNorm
-            nn.ReLU(),
-            nn.Linear(hid_dim_mlp, lat_dim)
-        )
-        self.cond_drop_prob = 0.1
-
-    def forward(self, zt, time_t, cell_type_labels=None):
-        current_device = zt.device
-        num_nodes = zt.size(0)
-        if num_nodes == 0:
-            return torch.empty(0, self.lat_dim, device=current_device, dtype=zt.dtype)
-
-        if not isinstance(time_t, torch.Tensor):
-            time_t_tensor = torch.full((num_nodes,), time_t, device=current_device, dtype=zt.dtype) # Ensure time_t is a tensor of size num_nodes
-        else:
-            if time_t.device != current_device: time_t = time_t.to(current_device)
-            if time_t.dtype != zt.dtype: time_t = time_t.to(zt.dtype)
-            if time_t.ndim == 0: time_t_tensor = time_t.unsqueeze(0).expand(num_nodes)
-            elif time_t.ndim == 1 and time_t.size(0) != num_nodes: raise ValueError(f"Time tensor 1D shape mismatch")
-            elif time_t.ndim == 2 and time_t.size(1) == 1 and time_t.size(0) == num_nodes: time_t_tensor = time_t.squeeze(1) # Remove last dim if size 1
-            elif time_t.ndim == 2 and time_t.size(0) == num_nodes and time_t.size(1) != 1: raise ValueError(f"Time tensor 2D shape mismatch")
-            elif time_t.ndim == 1 and time_t.size(0) == num_nodes: time_t_tensor = time_t # Already correct shape
-            else: raise ValueError(f"Unexpected time_t tensor shape: {time_t.shape}")
-
-
-        time_embedding = self.time_mlp(time_t_tensor.unsqueeze(-1)) # Add last dim for MLP
-
-        if cell_type_labels is not None:
-            if cell_type_labels.ndim == 0: cell_type_labels = cell_type_labels.unsqueeze(0)
-            if cell_type_labels.size(0) != num_nodes and num_nodes > 0:
-                 raise ValueError(f"Batch size mismatch for cell_type_labels and zt")
-            is_dropout = self.training and torch.rand(1).item() < self.cond_drop_prob # self.training here refers to nn.Module.training
-            if is_dropout:
-                cell_type_embedding = torch.zeros(num_nodes, self.time_embed_dim, device=current_device, dtype=zt.dtype)
-            else:
-                 if cell_type_labels.max() >= self.num_cell_types or cell_type_labels.min() < 0:
-                     cell_type_labels_clamped = torch.clamp(cell_type_labels, 0, self.num_cell_types - 1)
-                     cell_type_embedding = self.cell_type_embed(cell_type_labels_clamped)
-                 else:
-                    cell_type_embedding = self.cell_type_embed(cell_type_labels)
-        else:
-            cell_type_embedding = torch.zeros(num_nodes, self.time_embed_dim, device=current_device, dtype=zt.dtype)
-
-        combined_input = torch.cat([zt, time_embedding, cell_type_embedding], dim=1)
-        score_val = self.mlp(combined_input)
-        return score_val
-
-class ScoreSDE(nn.Module):
-    def __init__(self, score_model, T=1.0, N=1000):
-        super().__init__()
-        self.score_model = score_model
-        self.T = T
-        self.N = N
-        self.timesteps = torch.linspace(T, T / N, N, device=device, dtype=torch.float32)
-
-    def marginal_std(self, t):
-        if not isinstance(t, torch.Tensor): t = torch.tensor(t, device=self.timesteps.device, dtype=torch.float32)
-        elif t.device != self.timesteps.device: t = t.to(self.timesteps.device)
-        if t.dtype != torch.float32 and t.dtype != torch.float64: t = t.float()
-        if t.ndim == 0: t = t.unsqueeze(0)
-        return torch.sqrt(1. - torch.exp(-2 * t) + 1e-8)
-
-    @torch.no_grad()
-    def sample(self, z_shape, cell_type_labels=None):
-        current_device = self.timesteps.device
-        num_samples, lat_dim = z_shape
-        if num_samples == 0: return torch.empty(z_shape, device=current_device, dtype=torch.float32)
-
-        z = torch.randn(z_shape, device=current_device, dtype=torch.float32)
-        dt = self.T / self.N
-
-        if cell_type_labels is not None:
-            if cell_type_labels.device != current_device: cell_type_labels = cell_type_labels.to(current_device)
-            if cell_type_labels.size(0) == 1 and num_samples > 1: cell_type_labels = cell_type_labels.repeat(num_samples)
-            elif cell_type_labels.size(0) != num_samples: raise ValueError(f"Cell type labels size mismatch")
-
-        for i in range(self.N):
-            t_val_float = self.timesteps[i].item()
-            t_tensor_for_model = torch.full((num_samples,), t_val_float, device=current_device, dtype=z.dtype) # Pass time as tensor of size num_samples
-            sigma_t = self.marginal_std(t_val_float)
-            predicted_epsilon = self.score_model(z, t_tensor_for_model, cell_type_labels)
-            sigma_t_safe = sigma_t + 1e-8
-            drift = 2 * predicted_epsilon / sigma_t_safe
-            diffusion_coeff_input = torch.tensor(2 * dt + 1e-8, device=current_device, dtype=z.dtype)
-            diffusion_coeff = torch.sqrt(diffusion_coeff_input)
-            z = z + drift * dt + diffusion_coeff * torch.randn_like(z)
-        return z
-
-class FeatureDecoder(nn.Module):
-    def __init__(self, lat_dim, hid_dim, out_dim): # hid_dim is used for MLP layers
-        super().__init__()
-        self.decoder_mlp = nn.Sequential(
-            nn.Linear(lat_dim, hid_dim),
-            nn.LayerNorm(hid_dim), # Added LayerNorm
-            nn.ReLU(),
-            nn.Linear(hid_dim, hid_dim),
-            nn.LayerNorm(hid_dim), # Added LayerNorm
-            nn.ReLU(),
-            nn.Linear(hid_dim, out_dim)
-        )
-
-    def forward(self, z):
-        if z.size(0) == 0:
-            return torch.empty(0, self.decoder_mlp[-1].out_features, device=z.device, dtype=z.dtype)
-        log_rates = self.decoder_mlp(z)
-        return log_rates
-
 class Trainer:
     def __init__(self, in_dim, hid_dim, lat_dim, num_cell_types, pe_dim, timesteps, lr, warmup_steps, total_steps, loss_weights=None, input_masking_fraction=0.0): # Added input_masking_fraction
         print("\nInitializing Trainer...")
         self.encoder = SpectralEncoder(in_dim, hid_dim, lat_dim, pe_dim=pe_dim).to(device)
-        # Pass hid_dim for ScoreNet's internal MLP, can be different from GNN hid_dim
+        # pass hid_dim for ScoreNet's internal MLP, can be different from GNN hid_dim
         self.denoiser = ScoreNet(lat_dim, num_cell_types=num_cell_types, time_embed_dim=32, hid_dim_mlp=hid_dim).to(device)
         self.decoder = FeatureDecoder(lat_dim, hid_dim, in_dim).to(device) # Pass hid_dim for decoder's MLP
         self.diff = ScoreSDE(self.denoiser, T=1.0, N=timesteps).to(device)
@@ -583,7 +56,7 @@ class Trainer:
         self.optim = torch.optim.Adam(self.all_params, lr=lr)
         self.scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
         self.current_step = 0
-        self.input_masking_fraction = input_masking_fraction # Store masking fraction
+        self.input_masking_fraction = input_masking_fraction # store masking fraction
 
         if loss_weights is None: self.loss_weights = {'diff': 1.0, 'kl': 0.1, 'rec': 10.0}
         else: self.loss_weights = loss_weights
@@ -622,56 +95,54 @@ class Trainer:
         total_loss_val, total_loss_diff_val, total_loss_kl_val, total_loss_rec_val = 0.0, 0.0, 0.0, 0.0
         num_nodes_processed_in_epoch = 0
         num_batches_processed_in_epoch = 0
-
-        # Zero gradients once per epoch, before iterating through batches
         self.optim.zero_grad(set_to_none=True)
 
-        # Iterate through subgraph batches provided by NeighborLoader
+        # iterate through subgraph batches provided by NeighborLoader
         for batch_data in loader:
             # batch_data is a Data object for the current subgraph batch
-            batch_data = batch_data.to(device) # Move the batch data to device
+            batch_data = batch_data.to(device) 
 
-            # NeighborLoader batches contain different types of nodes:
+            # neighborLoader batches contain different types of nodes:
             # batch_data.x[:batch_data.batch_size] are the seed nodes
-            # The remaining nodes are neighbors sampled to compute representations for seed nodes
-            # Losses are typically computed only for the seed nodes.
+            # the remaining nodes are neighbors sampled to compute representations for seed nodes
+            # kosses are typically computed only for the seed nodes.
 
-            num_seed_nodes_in_batch = batch_data.batch_size # Number of seed nodes in this batch
-            num_nodes_in_batch = batch_data.x.size(0) # Total nodes in the subgraph batch (seeds + neighbors)
+            num_seed_nodes_in_batch = batch_data.batch_size # number of seed nodes in this batch
+            num_nodes_in_batch = batch_data.x.size(0) # total nodes in the subgraph batch (seeds + neighbors)
 
             if num_seed_nodes_in_batch == 0 or batch_data.x is None or batch_data.x.numel() == 0:
                  # print("Skipping empty batch (no seed nodes or features).")
                  continue
 
             # --- Input Gene Masking (applied to the full subgraph batch) ---
-            # We apply masking to the features of all nodes in the subgraph batch
+            # we apply masking to the features of all nodes in the subgraph batch
             original_x_batch = batch_data.x.clone() # Keep original for reconstruction target
             masked_x_batch = batch_data.x.clone()
             if self.encoder.training and self.input_masking_fraction > 0.0 and self.input_masking_fraction < 1.0:
                 mask = torch.rand_like(masked_x_batch) < self.input_masking_fraction
                 masked_x_batch[mask] = 0.0
 
-            # Get features and labels for the current subgraph batch
-            lap_pe_batch = batch_data.lap_pe # Laplacian PE for all nodes in the subgraph batch
+            # get features and labels for the current subgraph batch
+            lap_pe_batch = batch_data.lap_pe # laplacian PE for all nodes in the subgraph batch
             if lap_pe_batch is None or lap_pe_batch.size(0) != num_nodes_in_batch or lap_pe_batch.size(1) != self.encoder.pe_dim:
-                # If PE is missing or wrong shape for the batch, create zero PEs for the batch
+                # if PE is missing or wrong shape for the batch, create zero PEs for the batch
                 lap_pe_batch = torch.zeros(num_nodes_in_batch, self.encoder.pe_dim, device=device, dtype=masked_x_batch.dtype)
 
-            cell_type_labels_batch_full = batch_data.cell_type # Cell types for all nodes in the subgraph batch
+            cell_type_labels_batch_full = batch_data.cell_type # cell types for all nodes in the subgraph batch
             if cell_type_labels_batch_full is None or cell_type_labels_batch_full.size(0) != num_nodes_in_batch:
                  cell_type_labels_batch_full = torch.zeros(num_nodes_in_batch, dtype=torch.long, device=device)
 
-            # Ensure cell type labels are within the valid range for the embedding layer
+            # ensure cell type labels are within the valid range for the embedding layer
             if cell_type_labels_batch_full.max() >= self.denoiser.num_cell_types or cell_type_labels_batch_full.min() < 0:
                  cell_type_labels_batch_full = torch.clamp(cell_type_labels_batch_full, 0, self.denoiser.num_cell_types - 1)
 
             # --- Adversarial Perturbation (applied to edges within the subgraph batch) ---
-            # Apply perturbation to the edges of the current subgraph batch
+            # apply perturbation to the edges of the current subgraph batch
             batch_edge_index = batch_data.edge_index
             batch_edge_weights = torch.ones(batch_edge_index.size(1), device=device, dtype=masked_x_batch.dtype) if batch_edge_index.numel() > 0 else None
 
             if batch_edge_weights is not None and batch_edge_weights.numel() > 0:
-                 # Use the masked features of the subgraph batch for adversarial calculation
+                 # use the masked features of the subgraph batch for adversarial calculation
                  initial_perturbed_weights = self.lap_pert.sample(batch_edge_index, num_nodes_in_batch)
                  adversarially_perturbed_weights = self.lap_pert.adversarial(
                      self.encoder, masked_x_batch, batch_edge_index, initial_perturbed_weights
@@ -684,17 +155,17 @@ class Trainer:
             else:
                  adversarially_perturbed_weights = None
 
-            # Using autocast for mixed precision training
+            # using autocast for mixed precision training
             with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
-                # Encoder gets masked features and the subgraph structure
-                # It computes latent representations for ALL nodes in the subgraph batch (seeds + neighbors)
+                # encoder gets masked features and the subgraph structure
+                # it computes latent representations for ALL nodes in the subgraph batch (seeds + neighbors)
                 mu_full_batch, logvar_full_batch = self.encoder(masked_x_batch, batch_edge_index, lap_pe_batch, adversarially_perturbed_weights) # [num_nodes_in_batch, lat_dim]
 
                 if mu_full_batch.numel() == 0 or logvar_full_batch.numel() == 0:
                      print(f"Warning: Encoder output is empty for batch {num_batches_processed_in_epoch}. Skipping batch.")
                      continue
 
-                # Select outputs only for the SEED nodes (the first num_seed_nodes_in_batch nodes)
+                # select outputs only for the SEED nodes (the first num_seed_nodes_in_batch nodes)
                 mu = mu_full_batch[:num_seed_nodes_in_batch] # [num_seed_nodes_in_batch, lat_dim]
                 logvar = logvar_full_batch[:num_seed_nodes_in_batch] # [num_seed_nodes_in_batch, lat_dim]
                 cell_type_labels_batch = cell_type_labels_batch_full[:num_seed_nodes_in_batch] # [num_seed_nodes_in_batch]
@@ -710,10 +181,10 @@ class Trainer:
                     kl_div_terms_clamped = torch.relu(kl_div_terms)
                     if (kl_div_terms < -1e-5).any():
                         print(f"Warning: Negative KL term detected before clamping for batch {num_batches_processed_in_epoch}. Min term: {kl_div_terms.min().item()}")
-                    kl_div = torch.sum(kl_div_terms_clamped, dim=-1).mean() # Mean over seed nodes
+                    kl_div = torch.sum(kl_div_terms_clamped, dim=-1).mean() # mean over seed nodes
 
                 # --- Diffusion Loss (computed for seed nodes) ---
-                # Sample time steps per seed node
+                # sample time steps per seed node
                 t_indices = torch.randint(0, self.diff.N, (num_seed_nodes_in_batch,), device=device).long()
                 time_values_for_loss = self.diff.timesteps[t_indices] # [num_seed_nodes_in_batch]
 
@@ -721,22 +192,19 @@ class Trainer:
                 if sigma_t_batch.ndim == 1: sigma_t_batch = sigma_t_batch.unsqueeze(-1)
 
                 noise_target = torch.randn_like(mu) # [num_seed_nodes_in_batch, lat_dim]
-
-                # Corrupt mu (from the seed nodes)
+                # corrrupt mu (from the seed nodes)
                 alpha_t = torch.exp(-time_values_for_loss).unsqueeze(-1)
                 zt_corrupted = alpha_t * mu.detach() + sigma_t_batch * noise_target # [num_seed_nodes_in_batch, lat_dim]
-
-                # Denoiser predicts noise for the seed nodes, time, and cell type
+                # denoiser predicts noise for the seed nodes, time, and cell type
                 eps_predicted = self.denoiser(zt_corrupted, time_values_for_loss, cell_type_labels_batch) # [num_seed_nodes_in_batch, lat_dim]
 
                 loss_diff = F.mse_loss(eps_predicted, noise_target)
 
                 # --- Reconstruction Loss (computed for seed nodes) ---
-                # Decode the mean of the latent space (mu) for the seed nodes
+                # decode the mean of the latent space (mu) for the seed nodes
                 decoded_log_rates = self.decoder(mu) # [num_seed_nodes_in_batch, in_dim]
-
-                # Target is the original raw counts for the seed nodes
-                target_counts_batch = original_x_seed_batch.float() # Ensure target is float
+                # target is the original raw counts for the seed nodes
+                target_counts_batch = original_x_seed_batch.float() 
 
                 if decoded_log_rates.shape != target_counts_batch.shape:
                      print(f"Warning: Decoder output shape mismatch for batch {num_batches_processed_in_epoch}. Skipping reconstruction loss.")
@@ -747,32 +215,30 @@ class Trainer:
                 else:
                     loss_rec = F.poisson_nll_loss(decoded_log_rates, target_counts_batch, log_input=True, reduction='mean') # 'mean' averages over seed nodes and genes
 
-                # Apply weights and sum losses for the current batch
-                # Scale the batch loss by the number of SEED nodes in the batch for correct averaging
+                # apply weights and sum losses for the current batch
+                # scale the batch loss by the number of SEED nodes in the batch for correct averaging
                 batch_loss = (self.loss_weights.get('diff', 1.0) * loss_diff +
                               self.loss_weights.get('kl', 0.1) * kl_div +
                               self.loss_weights.get('rec', 1.0) * loss_rec)
 
-                # Check for NaN/Inf in the batch loss before backprop
                 if torch.isnan(batch_loss) or torch.isinf(batch_loss):
                     print(f"Warning: NaN/Inf batch loss detected at epoch {current_epoch_num}, batch {num_batches_processed_in_epoch}. Skipping backward pass for this batch.")
                     continue
 
                 # Backward pass for the current batch loss
-                # Accumulate gradients across batches
-                # Scale the loss by the number of seed nodes to average gradients correctly
-                # This is important because the batch size (number of seed nodes) can vary slightly
+                # accumulate gradients across batches
+                # scale the loss by the number of seed nodes to average gradients correctly
                 self.scaler.scale(batch_loss / num_seed_nodes_in_batch).backward()
 
-            # Accumulate losses for reporting (weighted by number of seed nodes in batch)
+            # accumulate losses for reporting (weighted by number of seed nodes in batch)
             total_loss_val += batch_loss.item()
-            total_loss_diff_val += loss_diff.item() * num_seed_nodes_in_batch # Accumulate unscaled losses for correct average calculation later
+            total_loss_diff_val += loss_diff.item() * num_seed_nodes_in_batch # accumulate unscaled losses for correct average calculation later
             total_loss_kl_val += kl_div.item() * num_seed_nodes_in_batch
             total_loss_rec_val += loss_rec.item() * num_seed_nodes_in_batch
-            num_nodes_processed_in_epoch += num_seed_nodes_in_batch # Count seed nodes processed
+            num_nodes_processed_in_epoch += num_seed_nodes_in_batch # count seed nodes processed
             num_batches_processed_in_epoch += 1
 
-            # Optional: Print debug info periodically
+            # optional: Print debug info
             # if num_batches_processed_in_epoch % 10 == 0 or num_batches_processed_in_epoch < 5 :
             #     lr_val = self.optim.param_groups[0]['lr']
             #     print(f"[DEBUG] Epoch {current_epoch_num} | Batch {num_batches_processed_in_epoch} | Seed Nodes: {num_seed_nodes_in_batch} | Total Nodes in Subgraph: {num_nodes_in_batch} | LR: {lr_val:.3e}")
@@ -781,45 +247,32 @@ class Trainer:
 
         # --- End of Batch Loop ---
 
-        # Perform optimizer step and scheduler step AFTER processing all batches in the epoch
+        # perform optimizer step and scheduler step AFTER processing all batches in the epoch
         if num_batches_processed_in_epoch > 0:
-            # Unscale gradients before clipping
             self.scaler.unscale_(self.optim)
-            # Clip gradients of all model parameters
             torch.nn.utils.clip_grad_norm_(self.all_params, max_norm=1.0)
-
-            # Perform optimizer step
             self.scaler.step(self.optim)
             self.scaler.update()
-
-            # Perform scheduler step
             self.scheduler.step()
-
-            # Increment global step counter after optimizer step (once per epoch)
             # self.current_step += 1 # Current step is now handled by scheduler.step() implicitly or can be tracked separately if needed
-
-            # Report average losses for the epoch (divide accumulated loss by total seed nodes processed)
-            # Need to recalculate averages from accumulated unscaled losses
-            avg_total_loss = total_loss_val / num_seed_nodes_in_batch # This is not quite right, need to average over all seed nodes in epoch
-            # Correct averaging: sum of losses / total number of seed nodes
+            avg_total_loss = total_loss_val / num_seed_nodes_in_batch 
             if num_nodes_processed_in_epoch > 0:
-                 avg_total_loss = total_loss_val / num_nodes_processed_in_epoch # Total accumulated loss / total seed nodes
+                 avg_total_loss = total_loss_val / num_nodes_processed_in_epoch # total accumulated loss / total seed nodes
                  avg_diff_loss = total_loss_diff_val / num_nodes_processed_in_epoch
                  avg_kl_loss = total_loss_kl_val / num_nodes_processed_in_epoch
                  avg_rec_loss = total_loss_rec_val / num_nodes_processed_in_epoch
             else:
                  avg_total_loss, avg_diff_loss, avg_kl_loss, avg_rec_loss = 0.0, 0.0, 0.0, 0.0
 
-            # The main epoch summary print is now outside the loop in the main block
-            return avg_total_loss, avg_diff_loss, avg_kl_loss, avg_rec_loss # Return all for detailed logging
+            return avg_total_loss, avg_diff_loss, avg_kl_loss, avg_rec_loss 
         else:
              print(f"Warning: No batches processed in epoch {current_epoch_num}.")
-             return 0.0, 0.0, 0.0, 0.0 # Return 0 if no batches processed
+             return 0.0, 0.0, 0.0, 0.0 # return 0 if no batches processed
 
     @torch.no_grad()
     def generate(self, num_samples, cell_type_condition=None):
         print(f"\nGenerating {num_samples} samples...")
-        self.denoiser.eval(); self.decoder.eval() # Set models to eval mode
+        self.denoiser.eval(); self.decoder.eval() 
         if cell_type_condition is None:
             print("Generating unconditionally.")
             gen_cell_type_labels_tensor = torch.zeros(num_samples, dtype=torch.long, device=device)
@@ -853,7 +306,7 @@ class Trainer:
     @torch.no_grad()
     def evaluate_generation(self, real_adata, generated_counts, generated_cell_types, n_pcs=30, mmd_scales=[0.01, 0.1, 1, 10, 100]):
         print("\n--- Computing Evaluation Metrics ---")
-        self.denoiser.eval(); self.decoder.eval() # Ensure models are in eval mode
+        self.denoiser.eval(); self.decoder.eval() 
         if hasattr(self, 'encoder'): self.encoder.eval()
 
         if not hasattr(real_adata, 'X') or real_adata.X is None:
@@ -861,20 +314,20 @@ class Trainer:
         real_counts = real_adata.X
 
         real_cell_types_present = False
-        real_cell_type_labels = np.zeros(real_counts.shape[0], dtype=int) # Default
-        real_cell_type_categories = ["Unknown"] # Default
+        real_cell_type_labels = np.zeros(real_counts.shape[0], dtype=int) 
+        real_cell_type_categories = ["Unknown"] 
 
         if hasattr(real_adata, 'obs') and 'cell_type' in real_adata.obs.columns:
             real_cell_types_present = True
             real_cell_type_series = real_adata.obs['cell_type']
             if not pd.api.types.is_categorical_dtype(real_cell_type_series):
                  try: real_cell_type_series = real_cell_type_series.astype('category')
-                 except Exception: # Fallback if conversion fails
+                 except Exception: 
                      unique_types, real_cell_type_labels_temp = np.unique(real_cell_type_series.values, return_inverse=True)
                      real_cell_type_categories = unique_types.tolist()
-                     real_cell_type_labels = real_cell_type_labels_temp # Assign if conversion succeeded
+                     real_cell_type_labels = real_cell_type_labels_temp 
 
-            if pd.api.types.is_categorical_dtype(real_cell_type_series): # Check again after potential conversion
+            if pd.api.types.is_categorical_dtype(real_cell_type_series): 
                 real_cell_type_labels = real_cell_type_series.cat.codes.values
                 real_cell_type_categories = real_cell_type_series.cat.categories.tolist()
 
@@ -995,11 +448,11 @@ if __name__ == '__main__':
     loss_weights = {'diff': 10.0, 'kl': 0.05, 'rec': 10.0}
     INPUT_MASKING_FRACTION = 0.3
 
-    TRAIN_H5AD = 'data/dentategyrus_train.h5ad' # 'data/pbmc3k_train.h5ad'
-    TEST_H5AD = 'data/dentategyrus_test.h5ad' # 'data/pbmc3k_test.h5ad'
-    DATA_ROOT = 'data/dentategyrus_processed' # 'data/pbmc3k_processed'
+    TRAIN_H5AD = 'data/dentategyrus_train.h5ad' 
+    TEST_H5AD = 'data/dentategyrus_test.h5ad' 
+    DATA_ROOT = 'data/dentategyrus_processed' 
     os.makedirs(DATA_ROOT, exist_ok=True)
-    # Include masking fraction in train data root to avoid reusing processed data with different masking
+    # include masking fraction in train data root to avoid reusing processed data with different masking
     TRAIN_DATA_ROOT = os.path.join(DATA_ROOT, f'train_k{K_NEIGHBORS}_pe{PE_DIM}_gt{GENE_THRESHOLD}_pca{PCA_NEIGHBORS}_mask{INPUT_MASKING_FRACTION}')
     TEST_DATA_ROOT = os.path.join(DATA_ROOT, f'test_k{K_NEIGHBORS}_pe{PE_DIM}_gt{GENE_THRESHOLD}_pca{PCA_NEIGHBORS}')
     os.makedirs(os.path.join(TRAIN_DATA_ROOT, 'processed'), exist_ok=True)
@@ -1007,7 +460,7 @@ if __name__ == '__main__':
 
     train_dataset = None
     input_feature_dim, num_cell_types = 0, 1
-    num_train_cells = 0 # Initialize
+    num_train_cells = 0 # initialize
     filtered_gene_names_from_train = []
 
     try:
@@ -1025,7 +478,7 @@ if __name__ == '__main__':
 
 
     if num_train_cells > 0 and input_feature_dim > 0:
-        # --- CHANGE START: Replace DataLoader with NeighborLoader ---
+        # --- DataLoader with NeighborLoader has been used rather than DataLoader---
         # NeighborLoader samples a batch of nodes and their neighbors up to num_hops
         # num_neighbors=[-1] means include all neighbors at each hop
         # batch_size is the number of seed nodes per batch
@@ -1035,9 +488,9 @@ if __name__ == '__main__':
         # If K=4 in ChebConv requires 4 hops of neighbors, set num_hops=4. Let's assume 2 hops for now.
         NUM_HOPS = 2 # Corresponds to the number of GNN layers
         train_loader = NeighborLoader(
-             data=train_dataset.get(0), # Explicitly name the data argument
-             num_neighbors=[-1] * NUM_HOPS, # Explicitly name the num_neighbors argument
-             batch_size=BATCH_SIZE, # keyword argument
+             data=train_dataset.get(0), 
+             num_neighbors=[-1] * NUM_HOPS, 
+             batch_size=BATCH_SIZE, 
         )
 
         TOTAL_TRAINING_STEPS = len(train_loader) * EPOCHS
@@ -1049,8 +502,6 @@ if __name__ == '__main__':
                           total_steps=TOTAL_TRAINING_STEPS, loss_weights=loss_weights, input_masking_fraction=INPUT_MASKING_FRACTION)
 
         if TOTAL_TRAINING_STEPS > 0:
-             # The scheduler step should happen after the first optimizer step, not before the loop.
-             # We will remove this initial step here. The first step will happen inside train_epoch after the first batch.
              # trainer.scheduler.step()
              print("Scheduler will be stepped after the first batch.")
 
@@ -1129,7 +580,7 @@ if __name__ == '__main__':
                              if metrics and "MMD" in metrics and metrics["MMD"]:
                                   for scale_key, mmd_val in metrics["MMD"].items():
                                       try:
-                                          # Extract scale value from keys like 'Conditional_Avg_Scale_0.1' or 'Unconditional_Scale_1.0'
+                                          # extract scale value from keys like 'Conditional_Avg_Scale_0.1' or 'Unconditional_Scale_1.0'
                                           parts = scale_key.split('_')
                                           if parts[-2] == 'Scale':
                                               scale_val_str = parts[-1]
