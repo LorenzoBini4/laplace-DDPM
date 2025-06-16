@@ -1,5 +1,10 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
+adv_cond_lap_ddpm.py
+cond_lap_ddpm.py
+lap_ddpm.py
+scrna_cond*.py
+scrna_graphddpm.py
 *.py[cod]
 *$py.class
 *.out
@@ -16,10 +21,6 @@ qualitative*/
 *.csv
 *delme/
 delme*
-*adv
-*cond
-*lap_ddpm.py*
-*scrna*
 # Distribution / packaging
 .Python
 build/
