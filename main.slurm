@@ -13,5 +13,5 @@
 source $HOME/.bashrc
 nvidia-smi
 
-python -u main_pbmc3k.py 
-# python -u main_denta.py 
+# python -u run_pbmc3k.py 
+python -u run_denta.py 
