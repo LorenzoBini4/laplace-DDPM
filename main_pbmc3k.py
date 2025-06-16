@@ -14,11 +14,11 @@ from sklearn.decomposition import PCA
 from scipy.spatial.distance import cdist # For pairwise distances in Wasserstein and MMD
 import sys # For checking installed modules
 import torch.distributions as dist # Import for Negative Binomial distribution
-from seed import *
-from utils import * 
-from dataset import*
-from models import *
-from viz import *
+from pbmc3k.seed import *
+from pbmc3k.utils import * 
+from pbmc3k.dataset import*
+from pbmc3k.models import *
+from pbmc3k.viz import *
 
 # Check for required libraries
 try:
