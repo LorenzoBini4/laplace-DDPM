@@ -16,6 +16,10 @@ qualitative*/
 *.csv
 *delme/
 delme*
+*adv
+*cond
+lap_ddpm.py
+*scrna_
 # Distribution / packaging
 .Python
 build/
