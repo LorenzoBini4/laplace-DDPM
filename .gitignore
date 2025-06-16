@@ -18,8 +18,8 @@ qualitative*/
 delme*
 *adv
 *cond
-lap_ddpm.py
-*scrna_
+*lap_ddpm.py*
+*scrna*
 # Distribution / packaging
 .Python
 build/
