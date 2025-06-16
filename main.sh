@@ -4,4 +4,5 @@
 # python -u delme.py > run_delme.o 2> run_delme.e
 # python -u scrna_cond_ddpm.py > run_scrna_ddpm.out 2> run_scrna_ddpm.err
 # python -u scrna_cond_ddpm_v2.py > run_scrna_ddpm_v2.out 2> run_scrna_ddpm_v2.err
-python -u scrna_cond_ddpm_v2_denta.py > run_scrna_ddpm_denta.out 2> run_scrna_ddpm_denta.err
+# python -u scrna_cond_ddpm_v2_denta.py > run_scrna_ddpm_denta.out 2> run_scrna_ddpm_denta.err
+python -u scrna_cond_ddpm_v3.py > run_scrna_ddpm_v3.out 2> run_scrna_ddpm_v3.err
