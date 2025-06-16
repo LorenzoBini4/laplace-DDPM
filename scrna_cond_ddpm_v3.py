@@ -1,27 +1,25 @@
 import torch
-import torch.nn as nn
 from torch_scatter import scatter_add, scatter_mean
 import torch.nn.functional as F
-from torch_geometric.data import InMemoryDataset, Data
 from torch_geometric.loader import DataLoader
 import pandas as pd
 import numpy as np
 from sklearn.neighbors import NearestNeighbors
 import scipy.sparse as sp
 from scipy.sparse.linalg import eigsh
-from torch_geometric.nn import ChebConv
-import torch_geometric.utils
 import os
 import traceback
 import scanpy as sc
-import anndata as ad
 from sklearn.decomposition import PCA
 from scipy.spatial.distance import cdist # For pairwise distances in Wasserstein and MMD
 import sys # For checking installed modules
-import random
 import torch.distributions as dist # Import for Negative Binomial distribution
-import matplotlib.pyplot as plt
-import seaborn as sns
+from seed import *
+from utils import * 
+from dataset import*
+from models import *
+from viz import *
+
 # Check for required libraries
 try:
     import torch
@@ -38,580 +36,6 @@ except ImportError as e:
     print(f"Missing required library: {e}. Please install it using pip.")
     print("Example: pip install torch torch-geometric torch-scatter scanpy anndata pandas numpy scikit-learn scipy POT")
     sys.exit("Required libraries not found.")
-
-
-torch.backends.cudnn.benchmark = True
-# Attempt to set device, fall back to CPU if CUDA is not available or fails
-try:
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-except Exception as e:
-    print(f"Error setting up CUDA device: {e}. Falling back to CPU.")
-    device = torch.device('cpu')
-
-print(f"Using device: {device}")
-
-def set_seed(seed):
-    """Set random seeds for reproducibility."""
-    if seed is not None:
-        print(f"Setting random seed to {seed}")
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
-
-# Helper function for Laplacian PE
-def compute_lap_pe(edge_index, num_nodes, k=10):
-    """
-    Computes Laplacian Positional Encoding for a graph.
-    Args:
-        edge_index (torch.Tensor): Graph connectivity in COO format.
-        num_nodes (int): Number of nodes in the graph.
-        k (int): Number of eigenvectors to compute for the PE.
-    Returns:
-        torch.Tensor: Laplacian PE of shape (num_nodes, k).
-    """
-    target_device = edge_index.device if edge_index.numel() > 0 else torch.device('cpu')
-    if num_nodes == 0: return torch.zeros((0, k), device=target_device, dtype=torch.float)
-    if edge_index.numel() == 0:
-        return torch.zeros((num_nodes, k), device=target_device, dtype=torch.float)
-
-    edge_index_np = edge_index.cpu().numpy()
-    if edge_index_np.max() >= num_nodes or edge_index_np.min() < 0:
-        print(f"Warning: Edge index out of bounds ({edge_index_np.min()},{edge_index_np.max()}). Num nodes: {num_nodes}. Clamping.")
-        edge_index_np = np.clip(edge_index_np, 0, num_nodes - 1)
-        valid_edges_mask = edge_index_np[0] != edge_index_np[1]
-        edge_index_np = edge_index_np[:, valid_edges_mask]
-        if edge_index_np.size == 0:
-            print("Warning: All edges removed after clamping. Returning zero PEs.")
-            return torch.zeros((num_nodes, k), device=target_device, dtype=torch.float)
-
-    data_np = np.ones(edge_index_np.shape[1])
-    try:
-        row, col = edge_index_np
-        adj = sp.coo_matrix((data_np, (row, col)), shape=(num_nodes, num_nodes), dtype=np.float32)
-    except Exception as e:
-        print(f"Error creating sparse adj matrix for PE: {e}"); return torch.zeros((num_nodes, k), device=target_device, dtype=torch.float)
-
-    adj = adj + adj.T
-    adj.data[adj.data > 1] = 1
-
-    deg = np.array(adj.sum(axis=1)).flatten()
-    deg_inv_sqrt = 1.0 / np.sqrt(np.maximum(deg, 1e-12))
-    deg_inv_sqrt_mat = sp.diags(deg_inv_sqrt)
-    L = sp.eye(num_nodes, dtype=np.float32) - deg_inv_sqrt_mat @ adj @ deg_inv_sqrt_mat
-
-    num_eigenvectors_to_compute = min(k + 1, num_nodes)
-    if num_eigenvectors_to_compute <= 1:
-        return torch.zeros((num_nodes, k), device=target_device, dtype=torch.float)
-
-    try:
-        eigvals, eigvecs = eigsh(L, k=num_eigenvectors_to_compute, which='SM', tol=1e-4,
-                                ncv=min(num_nodes, max(2 * num_eigenvectors_to_compute + 1, 20)))
-        sorted_indices = np.argsort(eigvals)
-        eigvecs = eigvecs[:, sorted_indices]
-    except Exception as e:
-        print(f"Eigenvalue computation failed for PE ({num_nodes} nodes, k={num_eigenvectors_to_compute}): {e}. Returning zero PEs.");
-        traceback.print_exc()
-        return torch.zeros((num_nodes, k), device=target_device, dtype=torch.float)
-
-    start_idx = 1 if eigvecs.shape[1] > 1 else 0
-    actual_k_to_use = min(k, eigvecs.shape[1] - start_idx)
-
-    if actual_k_to_use <= 0:
-        pe = torch.zeros((num_nodes, k), dtype=torch.float)
-    else:
-        pe = torch.from_numpy(eigvecs[:, start_idx : start_idx + actual_k_to_use]).float()
-        if pe.shape[1] < k:
-            padding = torch.zeros((num_nodes, k - pe.shape[1]), dtype=torch.float)
-            pe = torch.cat((pe, padding), dim=1)
-    return pe.to(target_device)
-
-class PBMC3KDataset(InMemoryDataset):
-    def __init__(self, h5ad_path, k_neighbors=15, pe_dim=10, root='data/pbmc3k', train=True, gene_threshold=20, pca_neighbors=50):
-        self.h5ad_path = h5ad_path
-        self.k_neighbors = k_neighbors
-        self.pe_dim = pe_dim
-        self.train = train
-        self.gene_threshold = gene_threshold
-        self.pca_neighbors = pca_neighbors
-        self.filtered_gene_names = []
-        self.cell_type_categories = ["Unknown"] # Default
-        self.num_cell_types = 1 # Default
-
-        processed_file = f'pbmc3k_{"train" if train else "test"}_k{k_neighbors}_pe{pe_dim}_gt{gene_threshold}_pca{pca_neighbors}.pt'
-        self.processed_file_names_list = [processed_file]
-        super().__init__(root=root, transform=None, pre_transform=None)
-
-        # Ensure processed data and metadata exist or process them
-        metadata_path = self.processed_paths[0].replace(".pt", "_metadata.pt")
-        if not os.path.exists(self.processed_paths[0]) or not os.path.exists(metadata_path):
-            print(f"Processed file or metadata not found. Dataset will be processed.")
-            if os.path.exists(self.processed_paths[0]): os.remove(self.processed_paths[0]) # Clean up if one exists but not other
-            if os.path.exists(metadata_path): os.remove(metadata_path)
-            self.process()
-        try:
-            self.data, self.slices = torch.load(self.processed_paths[0])
-            print(f"Successfully loaded processed data from {self.processed_paths[0]}")
-            if os.path.exists(metadata_path):
-                metadata = torch.load(metadata_path)
-                self.filtered_gene_names = metadata.get('filtered_gene_names', [])
-                self.cell_type_categories = metadata.get('cell_type_categories', ["Unknown"])
-                self.num_cell_types = metadata.get('num_cell_types', 1)
-                print(f"Loaded metadata: {len(self.filtered_gene_names)} filtered gene names, {self.num_cell_types} cell types ({self.cell_type_categories[:5]}...).")
-            else:
-                print(f"Warning: Metadata file {metadata_path} not found. Attributes might be default or inferred if possible.")
-                if self.data and hasattr(self.data, 'x') and self.data.x is not None:
-                    if not self.filtered_gene_names and self.data.x.shape[1] > 0 : self.filtered_gene_names = [f"gene_{i}" for i in range(self.data.x.shape[1])]
-                    if hasattr(self.data, 'cell_type') and self.data.cell_type is not None:
-                        unique_codes = torch.unique(self.data.cell_type).cpu().numpy()
-                        self.num_cell_types = len(unique_codes)
-                        self.cell_type_categories = [f"Type_{code}" for code in sorted(unique_codes)]
-            if self.data is None or self.data.num_nodes == 0:
-                 print("Warning: Loaded processed data is empty or has no nodes.")
-        
-        except Exception as e:
-            print(f"Error loading processed data or metadata from {self.processed_paths[0]}: {e}. Attempting to re-process.")
-            traceback.print_exc()
-            if os.path.exists(self.processed_paths[0]): os.remove(self.processed_paths[0])
-            if os.path.exists(metadata_path): os.remove(metadata_path)
-            self.process() # Re-process on loading error
-
-    @property
-    def raw_file_names(self):
-        return [os.path.basename(self.h5ad_path)]
-
-    @property
-    def processed_file_names(self):
-        return self.processed_file_names_list
-
-    def download(self):
-        if not os.path.exists(self.h5ad_path):
-            print(f"FATAL ERROR: H5AD file not found at {self.h5ad_path}");
-            raise FileNotFoundError(f"H5AD file not found: {self.h5ad_path}")
-        pass
-
-    def process(self):
-        print(f"Processing data from H5AD: {self.h5ad_path} for {'train' if self.train else 'test'} set.")
-        print(f"Parameters: k={self.k_neighbors}, PE_dim={self.pe_dim}, Gene Threshold={self.gene_threshold}, PCA Neighbors={self.pca_neighbors}")
-
-        try:
-            adata = sc.read_h5ad(self.h5ad_path)
-            if not isinstance(adata.X, (np.ndarray, sp.spmatrix)):
-                 print(f"Warning: adata.X is of type {type(adata.X)}. Attempting conversion.")
-                 try:
-                     adata.X = sp.csr_matrix(adata.X)
-                 except Exception as e:
-                     print(f"Could not convert adata.X: {e}")
-                     try:
-                         adata.X = np.array(adata.X)
-                     except Exception as e_dense:
-                         print(f"FATAL ERROR: Could not convert adata.X to sparse or dense: {e_dense}"); raise e_dense
-        except FileNotFoundError:
-            print(f"FATAL ERROR: H5AD file not found at {self.h5ad_path}"); raise
-        except Exception as e:
-            print(f"FATAL ERROR reading H5AD file {self.h5ad_path}: {e}"); traceback.print_exc(); raise
-
-        counts = adata.X
-        num_cells, initial_num_genes = counts.shape
-        print(f"Initial data shape: {num_cells} cells, {initial_num_genes} genes.")
-
-        if num_cells == 0 or initial_num_genes == 0:
-             print("Warning: Input data is empty. Creating empty Data object.")
-             data = Data(x=torch.empty((0, initial_num_genes), dtype=torch.float),
-                         edge_index=torch.empty((2,0), dtype=torch.long),
-                         cell_type=torch.empty(0, dtype=torch.long),
-                         lap_pe=torch.empty((0, self.pe_dim), dtype=torch.float),
-                         num_nodes=0)
-             data_list = [data]
-             data_to_save, slices_to_save = self.collate(data_list)
-             torch.save((data_to_save, slices_to_save), self.processed_paths[0])
-             print(f"Processed and saved empty data to {self.processed_paths[0]}")
-             return
-
-        print(f"Filtering genes expressed in fewer than {self.gene_threshold} cells.")
-        if sp.issparse(counts):
-            genes_expressed_count = np.asarray((counts > 0).sum(axis=0)).flatten()
-            genes_to_keep_mask = genes_expressed_count >= self.gene_threshold
-            counts = counts[:, genes_to_keep_mask]
-            self.filtered_gene_names = adata.var_names[genes_to_keep_mask].tolist()
-        else:
-            genes_expressed_count = np.count_nonzero(counts, axis=0)
-            genes_to_keep_mask = genes_expressed_count >= self.gene_threshold
-            counts = counts[:, genes_to_keep_mask]
-            if hasattr(adata, 'var_names') and adata.var_names is not None and len(adata.var_names) == initial_num_genes:
-                 self.filtered_gene_names = [adata.var_names[i] for i, keep in enumerate(genes_to_keep_mask) if keep]
-            else:
-                 print("Warning: Could not retrieve gene names from adata.var_names for filtered genes.")
-                 self.filtered_gene_names = [f'gene_{i}' for i in np.where(genes_to_keep_mask)[0]]
-
-        num_genes_after_filtering = counts.shape[1]
-        print(f"Number of genes after filtering: {num_genes_after_filtering}")
-
-        if num_genes_after_filtering == 0:
-            print("FATAL ERROR: All genes filtered out. Creating empty Data object.")
-            self.filtered_gene_names = []
-            data = Data(x=torch.empty((num_cells, 0), dtype=torch.float),
-                        edge_index=torch.empty((2,0), dtype=torch.long),
-                        cell_type=torch.empty(num_cells, dtype=torch.long),
-                        lap_pe=torch.empty((num_cells, self.pe_dim), dtype=torch.float),
-                        num_nodes=num_cells)
-            data_list = [data]
-            data_to_save, slices_to_save = self.collate(data_list)
-            torch.save((data_to_save, slices_to_save), self.processed_paths[0])
-            print(f"Processed and saved empty data to {self.processed_paths[0]}")
-            return
-
-        if 'cell_type' not in adata.obs.columns:
-             print("Warning: 'cell_type' not found in adata.obs.columns. Proceeding without cell type labels.")
-             cell_type_labels = np.zeros(num_cells, dtype=int)
-             num_cell_types = 1
-             cell_type_categories = ["Unknown"]
-        else:
-            cell_type_series = adata.obs['cell_type']
-            if not pd.api.types.is_categorical_dtype(cell_type_series):
-                 try:
-                     cell_type_series = cell_type_series.astype('category')
-                 except Exception as e:
-                      print(f"Error converting cell_type to categorical: {e}. Using raw values.")
-                      try:
-                           unique_types, cell_type_labels = np.unique(cell_type_series.values, return_inverse=True)
-                           num_cell_types = len(unique_types)
-                           cell_type_categories = unique_types.tolist()
-                           print(f"Found {num_cell_types} cell types (processed as inverse indices).")
-                      except Exception as e_inv:
-                           print(f"FATAL ERROR: Could not process cell types as categorical or inverse indices: {e_inv}"); traceback.print_exc(); raise e_inv
-            else:
-                cell_type_labels = cell_type_series.cat.codes.values
-                num_cell_types = len(cell_type_series.cat.categories)
-                cell_type_categories = cell_type_series.cat.categories.tolist()
-                print(f"Found {num_cell_types} cell types.")
-
-        self.num_cell_types = num_cell_types
-        self.cell_type_categories = cell_type_categories
-
-        edge_index = torch.empty((2,0), dtype=torch.long)
-        lap_pe = torch.zeros((num_cells, self.pe_dim), dtype=torch.float)
-
-        if num_cells > 1 and self.k_neighbors > 0 and num_genes_after_filtering > 0:
-            actual_k_for_knn = min(self.k_neighbors, num_cells - 1)
-            print(f"Building KNN graph with k={actual_k_for_knn} on {num_cells} cells based on PCA-reduced expression.")
-            pca_input = counts
-            if sp.issparse(pca_input):
-                try:
-                    print("Converting sparse counts to dense for PCA.")
-                    pca_input_dense = pca_input.toarray()
-                except Exception as e:
-                     print(f"Error converting sparse to dense for PCA: {e}. Using raw counts for KNN."); traceback.print_exc()
-                     pca_input_dense = counts
-            else:
-                 pca_input_dense = pca_input
-
-            pca_coords = None
-            if num_cells > 1 and pca_input_dense.shape[1] > 0:
-                 n_components_pca = min(self.pca_neighbors, pca_input_dense.shape[0] - 1, pca_input_dense.shape[1])
-                 if n_components_pca > 0:
-                     try:
-                         pca = PCA(n_components=n_components_pca, random_state=0)
-                         pca_coords = pca.fit_transform(pca_input_dense)
-                         print(f"PCA reduced data shape: {pca_coords.shape}")
-                     except Exception as e:
-                         print(f"Error during PCA for KNN graph: {e}. Using raw counts for KNN."); traceback.print_exc()
-                         pca_coords = pca_input_dense
-                 else:
-                      print("Warning: PCA components <= 0. Using raw counts for KNN.")
-                      pca_coords = pca_input_dense
-            else:
-                 print("Warning: Cannot perform PCA or KNN. Insufficient cells or features.")
-
-            knn_input_coords = pca_coords if pca_coords is not None else pca_input_dense
-            if knn_input_coords is not None and knn_input_coords.shape[0] > 1 and actual_k_for_knn > 0 and knn_input_coords.shape[1] > 0:
-                try:
-                    nbrs = NearestNeighbors(n_neighbors=actual_k_for_knn + 1, algorithm='auto', metric='euclidean').fit(knn_input_coords)
-                    distances, indices = nbrs.kneighbors(knn_input_coords)
-                    source_nodes = np.repeat(np.arange(num_cells), actual_k_for_knn)
-                    target_nodes = indices[:, 1:].flatten()
-                    edges = np.stack([source_nodes, target_nodes], axis=0)
-                    edge_index = torch.tensor(edges, dtype=torch.long)
-                    edge_index = torch_geometric.utils.to_undirected(edge_index, num_nodes=num_cells)
-                    edge_index, _ = torch_geometric.utils.remove_self_loops(edge_index)
-                    print(f"KNN graph built with {edge_index.size(1)} edges.")
-                except Exception as e:
-                    print(f"Error during KNN graph construction: {e}. Creating empty graph."); traceback.print_exc()
-                    edge_index = torch.empty((2,0), dtype=torch.long)
-            else:
-                 print("Warning: Cannot build KNN graph. Creating empty graph.")
-                 edge_index = torch.empty((2,0), dtype=torch.long)
-
-            if num_cells > 0 and edge_index.numel() > 0:
-                 print(f"Computing Laplacian PE with dim {self.pe_dim} for {num_cells} nodes.")
-                 try:
-                     lap_pe = compute_lap_pe(edge_index.cpu(), num_cells, k=self.pe_dim).to(device)
-                     lap_pe = lap_pe.to(torch.float32)
-                 except Exception as e:
-                      print(f"Error computing Laplacian PE: {e}. Returning zero PEs."); traceback.print_exc()
-                      lap_pe = torch.zeros((num_cells, self.pe_dim), device=device, dtype=torch.float32)
-            else:
-                 print("Skipping Laplacian PE computation.")
-                 lap_pe = torch.zeros((num_cells, self.pe_dim), device=device, dtype=torch.float32)
-
-        if sp.issparse(counts):
-            x = torch.from_numpy(counts.toarray().copy()).float()
-        else:
-            x = torch.from_numpy(counts.copy()).float()
-        cell_type = torch.from_numpy(cell_type_labels.copy()).long()
-        data = Data(x=x, edge_index=edge_index, lap_pe=lap_pe, cell_type=cell_type, num_nodes=num_cells)
-
-        if data.x.size(0) != num_cells: print(f"Warning: Data.x size mismatch.")
-        if data.lap_pe.size(0) != num_cells: print(f"Warning: Data.lap_pe size mismatch.")
-        if data.cell_type.size(0) != num_cells: print(f"Warning: Data.cell_type size mismatch.")
-        if data.edge_index.numel() > 0 and data.edge_index.max() >= num_cells: print(f"Warning: Edge index out of bounds.")
-
-        data_list = [data]
-        try:
-            data_to_save, slices_to_save = self.collate(data_list)
-            torch.save((data_to_save, slices_to_save), self.processed_paths[0])
-            print(f"Processed and saved data to {self.processed_paths[0]}")
-            metadata = {
-                'filtered_gene_names': self.filtered_gene_names,
-                'cell_type_categories': self.cell_type_categories,
-                'num_cell_types': self.num_cell_types
-            }
-            metadata_path = self.processed_paths[0].replace(".pt", "_metadata.pt")
-            torch.save(metadata, metadata_path)
-            print(f"Saved metadata to {metadata_path}")
-
-        except Exception as e:
-            print(f"FATAL ERROR during processing or saving data/metadata: {e}"); traceback.print_exc()
-            if os.path.exists(self.processed_paths[0]): os.remove(self.processed_paths[0])
-            metadata_path_check = self.processed_paths[0].replace(".pt", "_metadata.pt")
-            if os.path.exists(metadata_path_check): os.remove(metadata_path_check)
-            raise
-
-class LaplacianPerturb:
-    def __init__(self, alpha_min=1e-3, alpha_max=1e-2):
-        self.alpha_min = alpha_min
-        self.alpha_max = alpha_max
-
-    def sample(self, edge_index, num_nodes):
-        current_device = edge_index.device if edge_index.numel() > 0 else device
-        if edge_index.numel() == 0: return torch.empty((0,), device=current_device)
-        alpha = torch.rand(1, device=current_device, dtype=torch.float32) * (self.alpha_max - self.alpha_min) + self.alpha_min
-        signs = torch.randint(0, 2, (edge_index.size(1),), device=current_device, dtype=torch.float32) * 2.0 - 1.0
-        return 1.0 + alpha * signs
-
-    def adversarial(self, model_not_used, x, edge_index, current_weights, xi=1e-6, epsilon=0.1, ip=3):
-        num_nodes = x.size(0)
-        current_device = x.device
-        if num_nodes == 0 or edge_index.numel() == 0 or current_weights is None or current_weights.numel() == 0:
-            return current_weights.clone() if current_weights is not None else None
-
-        current_weights = torch.relu(current_weights) + 1e-8
-        if edge_index.max() >= num_nodes or edge_index.min() < 0:
-            print(f"Warning: Edge index out of bounds for adversarial perturbation. Skipping.")
-            return current_weights.clone()
-
-        adj = torch.sparse_coo_tensor(edge_index, current_weights.float(), (num_nodes, num_nodes), device=current_device).coalesce()
-        perturbed_weights = current_weights.clone()
-        with torch.no_grad():
-            v = torch.randn(num_nodes, 1, device=current_device, dtype=x.dtype) * 0.01
-            v = v / (v.norm() + 1e-8)
-            for _ in range(ip):
-                v_new = torch.sparse.mm(adj, v)
-                v_norm = v_new.norm()
-                if v_norm > 1e-9: v = v_new / v_norm
-                else: v = torch.randn(num_nodes, 1, device=current_device, dtype=x.dtype) * 0.01; v = v / (v.norm() + 1e-8)
-
-            if edge_index.size(1) == 0:
-                edge_specific_perturbation_term = torch.empty(0, device=current_device, dtype=x.dtype)
-            else:
-                v_i = v[edge_index[0]]
-                v_j = v[edge_index[1]]
-                edge_specific_perturbation_term = xi * v_i.squeeze(-1) * v_j.squeeze(-1)
-                if edge_specific_perturbation_term.shape != current_weights.shape:
-                    print(f"Warning: Shape mismatch in adversarial perturbation. Skipping.")
-                    return current_weights.clone()
-            perturbed_weights = current_weights + epsilon * edge_specific_perturbation_term
-        return perturbed_weights.clamp(min=1e-4, max=10.0)
-
-class SpectralEncoder(nn.Module):
-    def __init__(self, in_dim, hid_dim, lat_dim, pe_dim):
-        super().__init__()
-        self.pe_dim = pe_dim
-        self.cheb1 = ChebConv(in_dim + pe_dim, hid_dim, K=4)
-        self.cheb2 = ChebConv(hid_dim, hid_dim, K=4)
-        self.mu_net = nn.Linear(hid_dim, lat_dim)
-        self.logvar_net = nn.Linear(hid_dim, lat_dim)
-
-    def forward(self, x, edge_index, lap_pe, edge_weight=None):
-        current_device = x.device
-        num_nodes = x.size(0)
-        if num_nodes == 0:
-            return torch.empty(0, self.mu_net.out_features, device=current_device, dtype=x.dtype), \
-                    torch.empty(0, self.logvar_net.out_features, device=current_device, dtype=x.dtype)
-
-        if lap_pe is None or lap_pe.size(0) != num_nodes or lap_pe.size(1) != self.pe_dim:
-            lap_pe = torch.zeros(num_nodes, self.pe_dim, device=current_device, dtype=x.dtype)
-        x_combined = torch.cat([x, lap_pe], dim=1)
-
-        edge_index_sl, edge_weight_sl = edge_index, edge_weight
-        if edge_index.numel() > 0:
-            edge_index_sl, edge_weight_sl = torch_geometric.utils.add_self_loops(edge_index, edge_weight, num_nodes=num_nodes, fill_value=1.0)
-        elif num_nodes > 0:
-            edge_index_sl = torch.arange(num_nodes, device=current_device).repeat(2, 1)
-            edge_weight_sl = torch.ones(num_nodes, device=current_device, dtype=x.dtype)
-        else:
-            edge_index_sl = torch.empty((2,0), dtype=torch.long, device=current_device)
-            edge_weight_sl = None
-
-        if edge_weight_sl is not None:
-            if edge_weight_sl.device != current_device: edge_weight_sl = edge_weight_sl.to(current_device)
-            if edge_weight_sl.dtype != x_combined.dtype: edge_weight_sl = edge_weight_sl.to(x_combined.dtype)
-
-        h = F.relu(self.cheb1(x_combined, edge_index_sl, edge_weight_sl))
-        h = F.relu(self.cheb2(h, edge_index_sl, edge_weight_sl))
-        mu = self.mu_net(h)
-        logvar = self.logvar_net(h)
-        return mu, logvar
-
-class ScoreNet(nn.Module):
-    def __init__(self, lat_dim, num_cell_types, time_embed_dim=32, hid_dim_mlp=512): # Added hid_dim_mlp
-        super().__init__()
-        self.lat_dim = lat_dim
-        self.num_cell_types = num_cell_types
-        self.time_embed_dim = time_embed_dim
-
-        self.time_mlp = nn.Sequential(
-            nn.Linear(1, time_embed_dim),
-            nn.ReLU(),
-            nn.Linear(time_embed_dim, time_embed_dim)
-        )
-        self.cell_type_embed = nn.Embedding(num_cell_types, time_embed_dim)
-
-        # MLP with LayerNorm
-        self.mlp = nn.Sequential(
-            nn.Linear(lat_dim + time_embed_dim + time_embed_dim, hid_dim_mlp),
-            nn.LayerNorm(hid_dim_mlp), # Added LayerNorm
-            nn.ReLU(),
-            nn.Linear(hid_dim_mlp, hid_dim_mlp),
-            nn.LayerNorm(hid_dim_mlp), # Added LayerNorm
-            nn.ReLU(),
-            nn.Linear(hid_dim_mlp, lat_dim)
-        )
-        self.cond_drop_prob = 0.1
-
-    def forward(self, zt, time_t, cell_type_labels=None):
-        current_device = zt.device
-        num_nodes = zt.size(0)
-        if num_nodes == 0:
-            return torch.empty(0, self.lat_dim, device=current_device, dtype=zt.dtype)
-
-        if not isinstance(time_t, torch.Tensor):
-            time_t_tensor = torch.tensor([time_t], device=current_device, dtype=zt.dtype)
-        else:
-            if time_t.device != current_device: time_t = time_t.to(current_device)
-            if time_t.dtype != zt.dtype: time_t = time_t.to(zt.dtype)
-            time_t_tensor = time_t
-
-        if time_t_tensor.ndim == 0:
-            if num_nodes > 0: time_t_processed = time_t_tensor.unsqueeze(0).expand(num_nodes, 1)
-            else: time_t_processed = time_t_tensor.unsqueeze(0).unsqueeze(1)
-        elif time_t_tensor.ndim == 1:
-            if time_t_tensor.size(0) != num_nodes: raise ValueError(f"Time tensor 1D shape mismatch")
-            time_t_processed = time_t_tensor.unsqueeze(1)
-        elif time_t_tensor.ndim == 2 and time_t_tensor.size(1) == 1:
-            if time_t_tensor.size(0) != num_nodes: raise ValueError(f"Time tensor 2D shape mismatch")
-            time_t_processed = time_t_tensor
-        else: raise ValueError(f"Unexpected time_t tensor shape")
-
-        time_embedding = self.time_mlp(time_t_processed)
-
-        if cell_type_labels is not None:
-            if cell_type_labels.ndim == 0: cell_type_labels = cell_type_labels.unsqueeze(0)
-            if cell_type_labels.size(0) != num_nodes and num_nodes > 0:
-                raise ValueError(f"Batch size mismatch for cell_type_labels and zt")
-            is_dropout = self.training and torch.rand(1).item() < self.cond_drop_prob
-            if is_dropout:
-                cell_type_embedding = torch.zeros(num_nodes, self.time_embed_dim, device=current_device, dtype=zt.dtype)
-            else:
-                if cell_type_labels.max() >= self.num_cell_types or cell_type_labels.min() < 0:
-                    cell_type_labels_clamped = torch.clamp(cell_type_labels, 0, self.num_cell_types - 1)
-                    cell_type_embedding = self.cell_type_embed(cell_type_labels_clamped)
-                else:
-                    cell_type_embedding = self.cell_type_embed(cell_type_labels)
-        else:
-            cell_type_embedding = torch.zeros(num_nodes, self.time_embed_dim, device=current_device, dtype=zt.dtype)
-
-        combined_input = torch.cat([zt, time_embedding, cell_type_embedding], dim=1)
-        score_val = self.mlp(combined_input)
-        return score_val
-
-class ScoreSDE(nn.Module):
-    def __init__(self, score_model, T=1.0, N=1000):
-        super().__init__()
-        self.score_model = score_model
-        self.T = T
-        self.N = N
-        self.timesteps = torch.linspace(T, T / N, N, device=device, dtype=torch.float32)
-
-    def marginal_std(self, t):
-        if not isinstance(t, torch.Tensor): t = torch.tensor(t, device=self.timesteps.device, dtype=torch.float32)
-        elif t.device != self.timesteps.device: t = t.to(self.timesteps.device)
-        if t.dtype != torch.float32 and t.dtype != torch.float64: t = t.float()
-        if t.ndim == 0: t = t.unsqueeze(0)
-        return torch.sqrt(1. - torch.exp(-2 * t) + 1e-8)
-
-    @torch.no_grad()
-    def sample(self, z_shape, cell_type_labels=None):
-        current_device = self.timesteps.device
-        num_samples, lat_dim = z_shape
-        if num_samples == 0: return torch.empty(z_shape, device=current_device, dtype=torch.float32)
-
-        z = torch.randn(z_shape, device=current_device, dtype=torch.float32)
-        dt = self.T / self.N
-
-        if cell_type_labels is not None:
-            if cell_type_labels.device != current_device: cell_type_labels = cell_type_labels.to(current_device)
-            if cell_type_labels.size(0) == 1 and num_samples > 1: cell_type_labels = cell_type_labels.repeat(num_samples)
-            elif cell_type_labels.size(0) != num_samples: raise ValueError(f"Cell type labels size mismatch")
-
-        for i in range(self.N):
-            t_val_float = self.timesteps[i].item()
-            t_tensor_for_model = torch.full((num_samples,), t_val_float, device=current_device, dtype=z.dtype)
-            sigma_t = self.marginal_std(t_val_float)
-            predicted_epsilon = self.score_model(z, t_tensor_for_model, cell_type_labels)
-            sigma_t_safe = sigma_t + 1e-8
-            drift = 2 * predicted_epsilon / sigma_t_safe
-            diffusion_coeff_input = torch.tensor(2 * dt + 1e-8, device=current_device, dtype=z.dtype)
-            diffusion_coeff = torch.sqrt(diffusion_coeff_input)
-            z = z + drift * dt + diffusion_coeff * torch.randn_like(z)
-        return z
-
-class FeatureDecoder(nn.Module):
-    def __init__(self, lat_dim, hid_dim, out_dim): # hid_dim is used for MLP layers
-        super().__init__()
-        self.decoder_mlp = nn.Sequential(
-            nn.Linear(lat_dim, hid_dim),
-            nn.LayerNorm(hid_dim), # Added LayerNorm
-            nn.ReLU(),
-            nn.Linear(hid_dim, hid_dim),
-            nn.LayerNorm(hid_dim), # Added LayerNorm
-            nn.ReLU(),
-            nn.Linear(hid_dim, 2 * out_dim) # Output 2 * out_dim for log_mu and log_theta
-        )
-        self.out_dim = out_dim # Store out_dim
-
-    def forward(self, z):
-        if z.size(0) == 0:
-            # Return two empty tensors for log_mu and log_theta
-            return torch.empty(0, self.out_dim, device=z.device, dtype=z.dtype), \
-                torch.empty(0, self.out_dim, device=z.device, dtype=z.dtype)
-        
-        # Output is concatenated log_mu and log_theta
-        params = self.decoder_mlp(z)
-        log_mu = params[:, :self.out_dim]
-        log_theta = params[:, self.out_dim:] # log_theta for numerical stability
-        return log_mu, log_theta
 
 class Trainer:
     def __init__(self, in_dim, hid_dim, lat_dim, num_cell_types, pe_dim, timesteps, lr, warmup_steps, total_steps, loss_weights=None, input_masking_fraction=0.0): # Added input_masking_fraction
@@ -704,7 +128,6 @@ class Trainer:
                 else:
                     # Correct KL formula: 0.5 * sum(mu^2 + exp(logvar) - 1 - logvar)
                     # This should always be non-negative.
-                    # The original code's formula was equivalent but perhaps prone to small negative due to precision.
                     kl_div_terms = 0.5 * (mu.pow(2) + logvar.exp() - 1.0 - logvar)
                     # Ensure terms are non-negative (they should be theoretically)
                     kl_div_terms_clamped = torch.relu(kl_div_terms) # Clamp at zero if any small negatives occur due to precision
@@ -753,7 +176,7 @@ class Trainer:
                     loss_rec = -nb_dist.log_prob(target_counts).mean() # Negative log-likelihood
 
                 final_loss = (self.loss_weights.get('diff', 1.0) * loss_diff +
-                            self.loss_weights.get('kl', 0.1) * kl_div + # Consider KL annealing here
+                            self.loss_weights.get('kl', 0.1) * kl_div + # Optional KL annealing here
                             self.loss_weights.get('rec', 1.0) * loss_rec)
 
             if torch.isnan(final_loss) or torch.isinf(final_loss):
@@ -768,8 +191,8 @@ class Trainer:
             self.scheduler.step()
             self.current_step += 1
 
-            # Debug prints (can be made less frequent)
-            if self.current_step % 10 == 0 or num_batches_processed < 5 : # Print more often at start
+            # Debug prints for loss values and learning rate
+            if self.current_step % 10 == 0 or num_batches_processed < 5 : 
                 lr_val = self.optim.param_groups[0]['lr']
                 print(f"[DEBUG] Epoch {current_epoch_num} | Batch Step {self.current_step} (Overall) | Optim Steps (approx): {self.optim._step_count} | Scheduler Steps: {self.scheduler._step_count} | LR: {lr_val:.3e}")
                 print(f"    Losses -> Total: {final_loss.item():.4f}, Diff: {loss_diff.item():.4f}, KL: {kl_div.item():.4f}, Rec: {loss_rec.item():.4f}")
@@ -813,26 +236,26 @@ class Trainer:
         z_gen_shape = (num_samples, self.diff.score_model.lat_dim)
         z_generated = self.diff.sample(z_gen_shape, cell_type_labels=gen_cell_type_labels_tensor)
         
-        # Decoder now returns log_mu and log_theta
+        # decoder now returns log_mu and log_theta
         log_mu_gen, log_theta_gen = self.decoder(z_generated)
         
-        # Convert to mu and theta
+        # convert to mu and theta
         mu_gen = torch.exp(log_mu_gen)
         theta_gen = torch.exp(log_theta_gen)
         
-        # Clamp theta for stability during sampling
+        # clamp theta for stability during sampling
         theta_gen = torch.clamp(theta_gen, min=1e-6, max=1e6)
 
         try:
-            # Sample from Negative Binomial
-            # Using total_count and probs parameterization for stability
+            # sample from Negative Binomial
+            # using total_count and probs parameterization for stability
             # probs = mean / (mean + total_count)
             nb_dist = dist.NegativeBinomial(total_count=theta_gen, probs=mu_gen / (mu_gen + theta_gen))
             generated_counts_tensor = nb_dist.sample().int().float()
-            generated_counts_tensor = torch.nan_to_num(generated_counts_tensor, nan=0.0, posinf=0.0, neginf=0.0) # Handle potential NaNs from sampling
+            generated_counts_tensor = torch.nan_to_num(generated_counts_tensor, nan=0.0, posinf=0.0, neginf=0.0) # handle potential NaNs from sampling
         except Exception as e:
             print(f"Error during sampling from Negative Binomial: {e}. Returning zero counts."); traceback.print_exc()
-            generated_counts_tensor = torch.zeros_like(mu_gen) # Use mu_gen shape for consistency
+            generated_counts_tensor = torch.zeros_like(mu_gen) # use mu_gen shape for consistency
 
         generated_counts_np = generated_counts_tensor.cpu().numpy()
         generated_cell_types_np = gen_cell_type_labels_tensor.cpu().numpy()
@@ -841,8 +264,8 @@ class Trainer:
 
     @torch.no_grad()
     def evaluate_generation(self, real_adata, generated_counts, generated_cell_types, n_pcs=30, mmd_scales=[0.01, 0.1, 1, 10, 100]):
-        # This function remains largely the same. Ensure it's robust.
-        # Key is that real_adata should be the *filtered* test data.
+        # it ensures it's robust.
+        # key is that real_adata should be the *filtered* test data.
         print("\n--- Computing Evaluation Metrics ---")
         self.denoiser.eval(); self.decoder.eval()
         if hasattr(self, 'encoder'): self.encoder.eval()
@@ -905,7 +328,7 @@ class Trainer:
                 dist_yy = cdist(Y, Y, 'sqeuclidean')
                 dist_xy = cdist(X, Y, 'sqeuclidean')
                 for scale in scales_list:
-                    gamma = 1.0 / (2. * scale**2 + 1e-9) # Add epsilon for scale=0 case
+                    gamma = 1.0 / (2. * scale**2 + 1e-9) # add epsilon for scale=0 case
                     K_xx, K_yy, K_xy = np.exp(-gamma * dist_xx), np.exp(-gamma * dist_yy), np.exp(-gamma * dist_xy)
                     mmd2 = K_xx.mean() + K_yy.mean() - 2 * K_xy.mean()
                     mmd_vals[scale] = max(0, mmd2)
@@ -933,7 +356,7 @@ class Trainer:
                         a = np.ones(real_pca_type.shape[0]) / real_pca_type.shape[0]
                         b = np.ones(gen_pca_type.shape[0]) / gen_pca_type.shape[0]
                         w2_type = ot.emd2(a, b, M)
-                        cond_w_agg.append(np.sqrt(max(0, w2_type))) # Ensure non-negative before sqrt
+                        cond_w_agg.append(np.sqrt(max(0, w2_type))) # ensure non-negative before sqrt
                     except Exception as e_w: print(f"Error W-dist for type {ct_name}: {e_w}"); cond_w_agg.append(np.nan)
                 
                 for s in mmd_scales: mmd_results[f'Conditional_Avg_Scale_{s}'] = np.nanmean(cond_mmd_agg[s]) if cond_mmd_agg[s] else np.nan
@@ -961,241 +384,10 @@ class Trainer:
         print("Evaluation metrics computation complete.")
         return {"MMD": mmd_results, "Wasserstein": wasserstein_results}
 
-def generate_qualitative_plots(real_adata_filtered, generated_counts, generated_cell_types,
-                               train_cell_type_categories, train_filtered_gene_names,
-                               output_dir="qualitative_plots", umap_neighbors=15, model_name="Our Model"):
-    """
-    Generates and saves qualitative evaluation plots.
-    Args:
-        real_adata_filtered (anndata.AnnData): Filtered real AnnData object (test set).
-        generated_counts (np.ndarray): Generated gene expression counts.
-        generated_cell_types (np.ndarray): Generated cell type labels (integer codes).
-        train_cell_type_categories (list): List of cell type names from training data.
-        train_filtered_gene_names (list): List of filtered gene names from training data.
-        output_dir (str): Directory to save plots.
-        umap_neighbors (int): Number of neighbors for UMAP.
-        model_name (str): Name of the model for plot titles.
-    """
-    print(f"\n--- Generating Qualitative Plots in {output_dir} for {model_name} ---")
-    os.makedirs(output_dir, exist_ok=True)
-
-    if sp.issparse(real_adata_filtered.X):
-        real_counts_np = real_adata_filtered.X.toarray()
-    else:
-        real_counts_np = np.asarray(real_adata_filtered.X)
-
-    # --- Figure 1a: Mean-Variance Plot ---
-    print("Plotting Figure 1a: Mean-Variance Relationship...")
-    if real_counts_np.shape[0] > 0 and generated_counts.shape[0] > 0 and \
-       real_counts_np.shape[1] > 0 and generated_counts.shape[1] > 0 and \
-       real_counts_np.shape[1] == generated_counts.shape[1]:
-        real_means = np.mean(real_counts_np, axis=0)
-        real_vars = np.var(real_counts_np, axis=0)
-        gen_means = np.mean(generated_counts, axis=0)
-        gen_vars = np.var(generated_counts, axis=0)
-        plt.figure(figsize=(8, 6))
-        plt.scatter(real_means, real_vars, alpha=0.5, label='Real Data', s=10, c='blue', edgecolors='none')
-        plt.scatter(gen_means, gen_vars, alpha=0.5, label=f'Generated ({model_name})', s=10, c='red', edgecolors='none')
-        all_positive_means = np.concatenate([real_means[real_means > 1e-9], gen_means[gen_means > 1e-9]])
-        all_positive_vars = np.concatenate([real_vars[real_vars > 1e-9], gen_vars[gen_vars > 1e-9]])
-        min_val_plot = 1e-3; max_val_plot = 1.0
-        if len(all_positive_means) > 0 and len(all_positive_vars) > 0:
-            min_val_data = min(all_positive_means.min(), all_positive_vars.min())
-            max_val_data = max(all_positive_means.max(), all_positive_vars.max())
-            min_val_plot = max(1e-3, min_val_data); max_val_plot = max(1.0, max_val_data)
-        elif len(all_positive_means) > 0 :
-             min_val_plot = max(1e-3, all_positive_means.min()); max_val_plot = max(1.0, all_positive_means.max())
-        plt.plot([min_val_plot, max_val_plot], [min_val_plot, max_val_plot], 'k--', alpha=0.7, label='Mean = Variance (Poisson-like)')
-        plt.xscale('log'); plt.yscale('log')
-        plt.xlabel('Mean Gene Expression (log scale)'); plt.ylabel('Variance Gene Expression (log scale)')
-        plt.title('Figure 1a: Gene-wise Mean-Variance Relationship'); plt.legend()
-        plt.grid(True, which="both", ls="-", alpha=0.2); plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, f"figure1a_mean_variance_{model_name.replace(' ', '_')}.png"), dpi=300)
-        plt.close(); print("Figure 1a saved.")
-    else:
-        print("Skipping Figure 1a: Real or generated data is empty, or gene dimensions mismatch.")
-
-    # --- Figure 1b: Sparsity (Zeros per Cell) ---
-    print("Plotting Figure 1b: Zeros per Cell Distribution...")
-    if real_counts_np.shape[0] > 0 and generated_counts.shape[0] > 0:
-        real_zeros_per_cell = (real_counts_np == 0).sum(axis=1)
-        gen_zeros_per_cell = (generated_counts == 0).sum(axis=1)
-        plt.figure(figsize=(8, 6))
-        sns.histplot(real_zeros_per_cell, label='Real Data', stat='density', kde=True, alpha=0.6, bins=50, color='blue', element="step")
-        sns.histplot(gen_zeros_per_cell, label=f'Generated ({model_name})', stat='density', kde=True, alpha=0.6, bins=50, color='red', element="step")
-        plt.xlabel('Number of Zero Counts per Cell'); plt.ylabel('Density')
-        plt.title('Figure 1b: Distribution of Zero Counts per Cell (Sparsity)'); plt.legend()
-        plt.grid(True, which="both", ls="-", alpha=0.2); plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, f"figure1b_zeros_per_cell_{model_name.replace(' ', '_')}.png"), dpi=300)
-        plt.close(); print("Figure 1b saved.")
-    else:
-        print("Skipping Figure 1b: Real or generated data is empty.")
-
-    # --- Figure 2: UMAP Visualization (Separate Plots for Real and Generated) ---
-    print("Plotting Figure 2: Separate UMAP Visualizations for Real and Generated Data...")
-
-    # --- Process Real Data for UMAP ---
-    if real_counts_np.shape[0] > 0 and real_counts_np.shape[1] > 0:
-        adata_real_processed = real_adata_filtered.copy()
-        adata_real_processed.var_names = [str(name) for name in adata_real_processed.var_names] # Ensure var_names are strings
-
-        if 'cell_type' in adata_real_processed.obs:
-            if isinstance(adata_real_processed.obs['cell_type'].dtype, pd.CategoricalDtype):
-                adata_real_processed.obs['cell_type_str_umap'] = adata_real_processed.obs['cell_type']
-            elif pd.api.types.is_numeric_dtype(adata_real_processed.obs['cell_type']):
-                adata_real_processed.obs['cell_type_str_umap'] = adata_real_processed.obs['cell_type'].apply(
-                    lambda x: train_cell_type_categories[int(x)] if 0 <= int(x) < len(train_cell_type_categories) else f"UnknownReal_{int(x)}"
-                ).astype('category')
-            else:
-                adata_real_processed.obs['cell_type_str_umap'] = adata_real_processed.obs['cell_type'].astype('category')
-        else:
-            adata_real_processed.obs['cell_type_str_umap'] = pd.Categorical(['Unknown_Real'] * adata_real_processed.shape[0])
-
-        # UMAP pipeline for real data
-        sc.pp.normalize_total(adata_real_processed, target_sum=1e4)
-        sc.pp.log1p(adata_real_processed)
-        
-        try:
-            n_top_genes_hvg_real = min(2000, adata_real_processed.shape[1] - 1 if adata_real_processed.shape[1] > 1 else 1)
-            if n_top_genes_hvg_real > 0:
-                print("Performing HVG selection for real data with flavor 'cell_ranger'.")
-                # FIX: Use 'cell_ranger' flavor for HVG, as it handles non-integer data after normalization/log1p
-                sc.pp.highly_variable_genes(adata_real_processed, n_top_genes=n_top_genes_hvg_real, flavor='cell_ranger')
-                adata_real_hvg = adata_real_processed[:, adata_real_processed.var.highly_variable].copy()
-            else:
-                print("Warning: Not enough genes for HVG selection in real data. Using all genes.")
-                adata_real_hvg = adata_real_processed.copy()
-        except Exception as e_hvg_real:
-            print(f"Error selecting HVGs for real data: {e_hvg_real}. Using all genes for PCA/UMAP.")
-            adata_real_hvg = adata_real_processed.copy()
-
-        if adata_real_hvg.shape[1] > 0:
-            n_comps_pca_real = min(50, adata_real_hvg.shape[0] - 1 if adata_real_hvg.shape[0] > 1 else 50,
-                                   adata_real_hvg.shape[1] - 1 if adata_real_hvg.shape[1] > 1 else 50)
-            if n_comps_pca_real < 2:
-                print(f"Warning: Not enough features/samples for PCA in real data ({n_comps_pca_real} components). Skipping UMAP for real data.")
-            else:
-                sc.pp.scale(adata_real_hvg, max_value=10)
-                sc.tl.pca(adata_real_hvg, svd_solver='arpack', n_comps=n_comps_pca_real)
-                current_umap_neighbors_real = min(umap_neighbors, adata_real_hvg.shape[0] - 1 if adata_real_hvg.shape[0] > 1 else umap_neighbors)
-                if current_umap_neighbors_real < 2:
-                    print(f"Warning: Not enough samples for UMAP neighbors in real data ({current_umap_neighbors_real}). Skipping UMAP for real data.")
-                else:
-                    sc.pp.neighbors(adata_real_hvg, n_neighbors=current_umap_neighbors_real, use_rep='X_pca')
-                    sc.tl.umap(adata_real_hvg, min_dist=0.3)
-                    
-                    # Plot Real Data UMAP
-                    plt.figure(figsize=(8, 8))
-                    sc.pl.umap(adata_real_hvg, color='cell_type_str_umap',
-                               frameon=False, legend_fontsize=8, legend_loc='on data', show=False,
-                               title=f"UMAP of Real Data Cell Types",
-                               save=f"_figure2_umap_real_{model_name.replace(' ', '_')}.png")
-                    
-                    default_save_path_real = f"figures/umap_figure2_umap_real_{model_name.replace(' ', '_')}.png"
-                    target_save_path_real = os.path.join(output_dir, f"figure2_umap_real_cell_types_{model_name.replace(' ', '_')}.png")
-                    if os.path.exists(default_save_path_real):
-                        os.rename(default_save_path_real, target_save_path_real)
-                        print(f"Figure 2 (Real Data UMAP) saved to {target_save_path_real}")
-                    else:
-                        print(f"Warning: Scanpy UMAP plot for real data not found at default location: {default_save_path_real}")
-                    plt.close()
-        else:
-            print("Skipping UMAP for real data: No highly variable genes found or remaining.")
-    else:
-        print("Skipping UMAP for real data: Real data is empty.")
-
-
-    # --- Process Generated Data for UMAP ---
-    if generated_counts.shape[0] > 0 and generated_counts.shape[1] > 0:
-        gen_cell_type_str_list = [
-            train_cell_type_categories[int(code)] if 0 <= int(code) < len(train_cell_type_categories) else f"UnknownGen_{int(code)}"
-            for code in generated_cell_types
-        ]
-        
-        var_names_for_gen = [str(name) for name in train_filtered_gene_names]
-        if not var_names_for_gen and generated_counts.shape[1] > 0:
-            print("Warning: No gene names for generated data, creating dummy names for UMAP.")
-            var_names_for_gen = [f"Gene_{i}" for i in range(generated_counts.shape[1])]
-        elif generated_counts.shape[1] == 0:
-            print("Skipping UMAP for generated data: Generated counts have 0 genes.")
-            return # Exit plotting for UMAP if no genes
-
-        adata_gen_processed = ad.AnnData(
-            X=generated_counts,
-            obs=pd.DataFrame({
-                'cell_type_str_umap': pd.Categorical(gen_cell_type_str_list)
-            }),
-            var=pd.DataFrame(index=var_names_for_gen)
-        )
-        adata_gen_processed.var_names = [str(name) for name in adata_gen_processed.var_names] # Ensure var_names are strings
-
-        # UMAP pipeline for generated data
-        sc.pp.normalize_total(adata_gen_processed, target_sum=1e4)
-        sc.pp.log1p(adata_gen_processed)
-
-        try:
-            n_top_genes_hvg_gen = min(2000, adata_gen_processed.shape[1] - 1 if adata_gen_processed.shape[1] > 1 else 1)
-            if n_top_genes_hvg_gen > 0:
-                print("Performing HVG selection for generated data with flavor 'cell_ranger'.")
-                # FIX: Use 'cell_ranger' flavor for HVG
-                sc.pp.highly_variable_genes(adata_gen_processed, n_top_genes=n_top_genes_hvg_gen, flavor='cell_ranger')
-                adata_gen_hvg = adata_gen_processed[:, adata_gen_processed.var.highly_variable].copy()
-            else:
-                print("Warning: Not enough genes for HVG selection in generated data. Using all genes.")
-                adata_gen_hvg = adata_gen_processed.copy()
-        except Exception as e_hvg_gen:
-            print(f"Error selecting HVGs for generated data: {e_hvg_gen}. Using all genes for PCA/UMAP.")
-            adata_gen_hvg = adata_gen_processed.copy()
-
-        if adata_gen_hvg.shape[1] > 0:
-            n_comps_pca_gen = min(50, adata_gen_hvg.shape[0] - 1 if adata_gen_hvg.shape[0] > 1 else 50,
-                                  adata_gen_hvg.shape[1] - 1 if adata_gen_hvg.shape[1] > 1 else 50)
-            if n_comps_pca_gen < 2:
-                print(f"Warning: Not enough features/samples for PCA in generated data ({n_comps_pca_gen} components). Skipping UMAP for generated data.")
-            else:
-                sc.pp.scale(adata_gen_hvg, max_value=10)
-                sc.tl.pca(adata_gen_hvg, svd_solver='arpack', n_comps=n_comps_pca_gen)
-                current_umap_neighbors_gen = min(umap_neighbors, adata_gen_hvg.shape[0] - 1 if adata_gen_hvg.shape[0] > 1 else umap_neighbors)
-                if current_umap_neighbors_gen < 2:
-                    print(f"Warning: Not enough samples for UMAP neighbors in generated data ({current_umap_neighbors_gen}). Skipping UMAP for generated data.")
-                else:
-                    sc.pp.neighbors(adata_gen_hvg, n_neighbors=current_umap_neighbors_gen, use_rep='X_pca')
-                    sc.tl.umap(adata_gen_hvg, min_dist=0.3)
-
-                    # Plot Generated Data UMAP
-                    plt.figure(figsize=(8, 8))
-                    sc.pl.umap(adata_gen_hvg, color='cell_type_str_umap',
-                               frameon=False, legend_fontsize=8, legend_loc='on data', show=False,
-                               title=f"UMAP of Generated ({model_name}) Cell Types",
-                               save=f"_figure2_umap_gen_{model_name.replace(' ', '_')}.png")
-                    
-                    default_save_path_gen = f"figures/umap_figure2_umap_gen_{model_name.replace(' ', '_')}.png"
-                    target_save_path_gen = os.path.join(output_dir, f"figure2_umap_generated_cell_types_{model_name.replace(' ', '_')}.png")
-                    if os.path.exists(default_save_path_gen):
-                        os.rename(default_save_path_gen, target_save_path_gen)
-                        print(f"Figure 2 (Generated Data UMAP) saved to {target_save_path_gen}")
-                    else:
-                        print(f"Warning: Scanpy UMAP plot for generated data not found at default location: {default_save_path_gen}")
-                    plt.close()
-        else:
-            print("Skipping UMAP for generated data: No highly variable genes found or remaining.")
-    else:
-        print("Skipping UMAP for generated data: Generated data is empty.")
-
-    # Clean up the 'figures' directory if it's empty after moving
-    if os.path.exists("./figures") and not os.listdir("./figures"):
-        try:
-            os.rmdir("./figures")
-        except OSError:
-            pass # Directory might not be empty if other plots are saved there by scanpy
-            
-    print(f"Qualitative plotting for {model_name} finished.")
-
-
 if __name__ == '__main__':
-    BATCH_SIZE = 64 # For DataLoader, but PBMC3KDataset is InMemory, so effectively 1 batch of the whole graph
+    BATCH_SIZE = 64 # for DataLoader, but PBMC3KDataset is InMemory, so effectively 1 batch of the whole graph
     LEARNING_RATE = 1e-3
-    EPOCHS = 1500 # Reduced epochs as a starting point for testing
+    EPOCHS = 1500 
     HIDDEN_DIM = 1024
     LATENT_DIM = 1024
     PE_DIM = 50
@@ -1206,16 +398,16 @@ if __name__ == '__main__':
     GLOBAL_SEED = 69
     set_seed(GLOBAL_SEED)
 
-    # Consider annealing KL weight: start small (e.g., 0 or 1e-4) and increase to target over epochs.
-    loss_weights = {'diff': 10.0, 'kl': 0.005, 'rec': 20.0} # Adjusted KL weight
-    INPUT_MASKING_FRACTION = 0.1 # Fraction of input genes to mask during training (0.0 to disable)
+    # optional adding annealing KL weight: start small (e.g., 0 or 1e-4) and increase to target over epochs.
+    loss_weights = {'diff': 10.0, 'kl': 0.005, 'rec': 20.0} # adjusted KL weight
+    INPUT_MASKING_FRACTION = 0.1 # fraction of input genes to mask during training (0.0 to disable)
 
     TRAIN_H5AD = 'data/pbmc3k_train.h5ad'
     TEST_H5AD = 'data/pbmc3k_test.h5ad'
     DATA_ROOT = 'data/pbmc3k_processed'
     os.makedirs(DATA_ROOT, exist_ok=True)
     TRAIN_DATA_ROOT = os.path.join(DATA_ROOT, f'train_k{K_NEIGHBORS}_pe{PE_DIM}_gt{GENE_THRESHOLD}_pca{PCA_NEIGHBORS}_mask{INPUT_MASKING_FRACTION}')
-    TEST_DATA_ROOT = os.path.join(DATA_ROOT, f'test_k{K_NEIGHBORS}_pe{PE_DIM}_gt{GENE_THRESHOLD}_pca{PCA_NEIGHBORS}') # Test data processing shouldn't change with masking
+    TEST_DATA_ROOT = os.path.join(DATA_ROOT, f'test_k{K_NEIGHBORS}_pe{PE_DIM}_gt{GENE_THRESHOLD}_pca{PCA_NEIGHBORS}') # test data processing shouldn't change with masking
     os.makedirs(os.path.join(TRAIN_DATA_ROOT, 'processed'), exist_ok=True)
     os.makedirs(os.path.join(TEST_DATA_ROOT, 'processed'), exist_ok=True)
 
@@ -1238,8 +430,8 @@ if __name__ == '__main__':
 
 
     if num_train_cells > 0 and input_feature_dim > 0:
-        # Note: For InMemoryDataset, DataLoader typically yields the whole dataset as one batch.
-        # If batch_size is set, it's often for compatibility but doesn't create mini-batches unless dataset is a list of Data objects.
+        # note: for InMemoryDataset, DataLoader typically yields the whole dataset as one batch.
+        # if batch_size is set, it's often for compatibility but doesn't create mini-batches unless dataset is a list of Data objects.
         train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=0, drop_last=False) # batch_size=1 for clarity with InMemoryDataset
         
         TOTAL_TRAINING_STEPS = len(train_loader) * EPOCHS # len(train_loader) will be 1
@@ -1252,14 +444,33 @@ if __name__ == '__main__':
 
         if TOTAL_TRAINING_STEPS > 0:
             print(f"\nStarting training for {EPOCHS} epochs. Total steps: {TOTAL_TRAINING_STEPS}, Warmup: {WARMUP_STEPS}. Initial LR: {LEARNING_RATE:.2e}")
-            # Implement a simple validation scheme or early stopping here if you have validation data.
-            # For now, just training for fixed epochs.
             for epoch in range(1, EPOCHS + 1):
-                # Pass epoch number for logging inside train_epoch
+                # pass epoch number for logging inside train_epoch
                 avg_total_loss, avg_diff_loss, avg_kl_loss, avg_rec_loss = trainer.train_epoch(train_loader, epoch)
                 current_lr = trainer.optim.param_groups[0]["lr"]
                 print(f"Epoch {epoch:03d}/{EPOCHS} Summary -> AvgTotal: {avg_total_loss:.4f}, AvgDiff: {avg_diff_loss:.4f}, AvgKL: {avg_kl_loss:.4f}, AvgRec: {avg_rec_loss:.4f}, LR: {current_lr:.3e}")
-                # Add checkpoint saving if needed
+                # add checkpoint if optional
+                if epoch % 100 == 0 or epoch == EPOCHS: # save every 100 epochs or last epoch
+                    checkpoint_path = os.path.join(TRAIN_DATA_ROOT, f'trainer_checkpoint_epoch_{epoch}.pt')
+                    torch.save({
+                        'epoch': epoch,
+                        'model_state_dict': trainer.state_dict(),
+                        'optimizer_state_dict': trainer.optim.state_dict(),
+                        'scheduler_state_dict': trainer.scheduler.state_dict(),
+                        'scaler_state_dict': trainer.scaler.state_dict(),
+                    }, checkpoint_path)
+                    print(f"Checkpoint saved at: {checkpoint_path}")
+            print(f"\nTraining completed. Total steps: {trainer.current_step}, Final LR: {trainer.optim.param_groups[0]['lr']:.3e}")
+            # final save of the trainer state
+            final_checkpoint_path = os.path.join(TRAIN_DATA_ROOT, 'trainer_final_state.pt')
+            torch.save({
+                'epoch': EPOCHS,
+                'model_state_dict': trainer.state_dict(),
+                'optimizer_state_dict': trainer.optim.state_dict(),
+                'scheduler_state_dict': trainer.scheduler.state_dict(),
+                'scaler_state_dict': trainer.scaler.state_dict(),
+            }, final_checkpoint_path)
+            print(f"Final trainer state saved at: {final_checkpoint_path}")
             print("\nTraining completed.")
         else: print("\nSkipping training: No training steps.")
     else: print("\nSkipping training: Training data empty/no features.")
@@ -1289,7 +500,7 @@ if __name__ == '__main__':
 
     if test_adata is not None and test_adata.shape[0] > 0 and test_adata.shape[1] > 0 and filtered_gene_names_from_train:
         if 'trainer' in locals() and trainer is not None:
-            if trainer.decoder.out_dim != num_genes_eval: # Check decoder's stored out_dim
+            if trainer.decoder.out_dim != num_genes_eval: # check decoder's stored out_dim
                 print(f"FATAL ERROR: Decoder output dim ({trainer.decoder.out_dim}) != test gene dim ({num_genes_eval}). Skipping eval.")
             else:
                 num_test_cells = test_adata.shape[0]
@@ -1320,16 +531,16 @@ if __name__ == '__main__':
                             metrics = trainer.evaluate_generation(real_adata=test_adata, generated_counts=generated_datasets_counts[i], generated_cell_types=generated_datasets_cell_types[i])
                             print(f"Metrics for dataset {i+1}: {metrics}")
                             if metrics and "MMD" in metrics and metrics["MMD"]:
-                                for scale_key, mmd_val in metrics["MMD"].items(): # Iterate through whatever MMD results are there
-                                    # Try to parse scale from key like 'Conditional_Avg_Scale_0.1' or 'Unconditional_Scale_0.1'
+                                for scale_key, mmd_val in metrics["MMD"].items(): # iterate through whatever MMD results are there
+                                    # try to parse scale from key like 'Conditional_Avg_Scale_0.1' or 'Unconditional_Scale_0.1'
                                     try:
                                         scale_val_float = float(scale_key.split('_')[-1])
                                         if scale_val_float in all_mmd_results_per_scale and not np.isnan(mmd_val):
                                             all_mmd_results_per_scale[scale_val_float].append(mmd_val)
-                                    except ValueError: pass # Key doesn't end with a float scale
+                                    except ValueError: pass # key doesn't end with a float scale
                             if metrics and "Wasserstein" in metrics and metrics["Wasserstein"]:
                                 for w_key, w_val in metrics["Wasserstein"].items(): # e.g. 'Conditional_Avg' or 'Unconditional'
-                                    if not np.isnan(w_val): all_wasserstein_results.append(w_val) # Aggregate all valid W-distances
+                                    if not np.isnan(w_val): all_wasserstein_results.append(w_val) # aggregate all valid W-distances
                         except Exception as e_eval_loop: print(f"Error evaluating dataset {i+1}: {e_eval_loop}")
                 
                 print("\n--- Averaged Evaluation Metrics over Generated Datasets ---")
@@ -1351,17 +562,17 @@ if __name__ == '__main__':
                 if not filtered_gene_names_from_train:
                     print("Warning: 'filtered_gene_names_from_train' is empty. UMAP gene names might be incorrect.")
 
-                # Use the last generated dataset for plotting
+                # use the last generated dataset for plotting
                 if generated_datasets_counts and generated_datasets_counts[-1] is not None:
                     generate_qualitative_plots(
-                        real_adata_filtered=test_adata, # Pass the filtered real AnnData
+                        real_adata_filtered=test_adata, # pass the filtered real AnnData
                         generated_counts=generated_datasets_counts[-1],
                         generated_cell_types=generated_datasets_cell_types[-1],
                         train_cell_type_categories=current_train_cell_type_categories,
-                        train_filtered_gene_names=filtered_gene_names_from_train, # This should be available from training data loading
+                        train_filtered_gene_names=filtered_gene_names_from_train, # this should be available from training data loading
                         output_dir=output_plot_dir,
-                        umap_neighbors=K_NEIGHBORS, # Use your global K_NEIGHBORS
-                        model_name="LapDDPM" # Your model's name
+                        umap_neighbors=K_NEIGHBORS, # used global K_NEIGHBORS
+                        model_name="LapDDPM"
                     )
                 else:
                     print("Skipping qualitative plots: No valid generated data for plotting.")
