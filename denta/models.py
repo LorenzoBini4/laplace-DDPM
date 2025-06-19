@@ -6,8 +6,8 @@ from torch_geometric.nn import ChebConv
 from torch_geometric.utils import add_self_loops
 import numpy as np
 import scipy.sparse as sp   
-from seed import *
-from utils import *
+from .seed import *
+from .utils import *
 
 class LaplacianPerturb:
     def __init__(self, alpha_min=1e-3, alpha_max=1e-2):

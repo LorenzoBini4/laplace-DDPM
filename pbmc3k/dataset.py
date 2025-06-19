@@ -9,7 +9,7 @@ from torch_geometric.data import InMemoryDataset, Data
 from torch_geometric.utils import remove_self_loops, to_undirected
 from sklearn.neighbors import NearestNeighbors
 from sklearn.decomposition import PCA
-from utils import compute_lap_pe
+from .utils import compute_lap_pe
 import torch_geometric
 from torch_geometric.data import download_url, extract_zip
 

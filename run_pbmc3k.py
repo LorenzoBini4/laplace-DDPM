@@ -57,7 +57,6 @@ class Trainer:
         print(f"Using loss weights: {self.loss_weights}")
         print(f"Input masking fraction: {self.input_masking_fraction}")
 
-
         num_warmup_steps_captured = warmup_steps
         num_training_steps_captured = total_steps
         def lr_lambda_fn(current_scheduler_step):
@@ -194,7 +193,7 @@ class Trainer:
             # Debug prints for loss values and learning rate
             if self.current_step % 10 == 0 or num_batches_processed < 5 : 
                 lr_val = self.optim.param_groups[0]['lr']
-                print(f"[DEBUG] Epoch {current_epoch_num} | Batch Step {self.current_step} (Overall) | Optim Steps (approx): {self.optim._step_count} | Scheduler Steps: {self.scheduler._step_count} | LR: {lr_val:.3e}")
+                print(f"Epoch {current_epoch_num} | Batch Step {self.current_step} (Overall) | Optim Steps (approx): {self.optim._step_count} | Scheduler Steps: {self.scheduler._step_count} | LR: {lr_val:.3e}")
                 print(f"    Losses -> Total: {final_loss.item():.4f}, Diff: {loss_diff.item():.4f}, KL: {kl_div.item():.4f}, Rec: {loss_rec.item():.4f}")
 
 
@@ -216,6 +215,17 @@ class Trainer:
             print(f"Warning: No batches processed in epoch {current_epoch_num}.")
             return 0.0, 0.0, 0.0, 0.0
 
+    def state_dict(self):
+        return {
+            'encoder': self.encoder.state_dict(),
+            'denoiser': self.denoiser.state_dict(),
+            'decoder': self.decoder.state_dict(),
+            'diff': self.diff.state_dict() if hasattr(self.diff, 'state_dict') else {},
+            'current_step': self.current_step,
+            'input_masking_fraction': self.input_masking_fraction,
+            'loss_weights': self.loss_weights,
+        }
+    
     @torch.no_grad()
     def generate(self, num_samples, cell_type_condition=None):
         print(f"\nGenerating {num_samples} samples...")
@@ -396,6 +406,7 @@ if __name__ == '__main__':
     GENE_THRESHOLD = 20
     TIMESTEPS_DIFFUSION = 1000
     GLOBAL_SEED = 69
+    VIZ = False
     set_seed(GLOBAL_SEED)
 
     # optional adding annealing KL weight: start small (e.g., 0 or 1e-4) and increase to target over epochs.
@@ -564,16 +575,19 @@ if __name__ == '__main__':
 
                 # use the last generated dataset for plotting
                 if generated_datasets_counts and generated_datasets_counts[-1] is not None:
-                    generate_qualitative_plots(
-                        real_adata_filtered=test_adata, # pass the filtered real AnnData
-                        generated_counts=generated_datasets_counts[-1],
-                        generated_cell_types=generated_datasets_cell_types[-1],
-                        train_cell_type_categories=current_train_cell_type_categories,
-                        train_filtered_gene_names=filtered_gene_names_from_train, # this should be available from training data loading
-                        output_dir=output_plot_dir,
-                        umap_neighbors=K_NEIGHBORS, # used global K_NEIGHBORS
-                        model_name="LapDDPM"
-                    )
+                    if VIZ == False:
+                        print("Done.")
+                    else:
+                        generate_qualitative_plots(
+                            real_adata_filtered=test_adata, # pass the filtered real AnnData
+                            generated_counts=generated_datasets_counts[-1],
+                            generated_cell_types=generated_datasets_cell_types[-1],
+                            train_cell_type_categories=current_train_cell_type_categories,
+                            train_filtered_gene_names=filtered_gene_names_from_train, # this should be available from training data loading
+                            output_dir=output_plot_dir,
+                            umap_neighbors=K_NEIGHBORS, # used global K_NEIGHBORS
+                            model_name="LapDDPM"
+                        )
                 else:
                     print("Skipping qualitative plots: No valid generated data for plotting.")
                 # --- END OF QUALITATIVE PLOTTING ---
