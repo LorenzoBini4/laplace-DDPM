@@ -9,9 +9,9 @@
 #SBATCH --time 0-04:14:59                  # maximum run time.
 #SBATCH --nodelist=kmer
 
-## USED Python 3.8.18, test_gpu as env
+## USED Python 3.8.18, lapddpm as env
 source $HOME/.bashrc
 nvidia-smi
 
-# python -u run_pbmc3k.py
-python -u run_denta.py
+python -u run_pbmc3k.py
+# python -u run_denta.py
