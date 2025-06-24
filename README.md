@@ -26,7 +26,7 @@ The repository is organized as follows:
 │   └── ...
 ├── denta/                  # Python package for the Dentate Gyrus dataset
 │   └── ...
-├── results/                # Directory for storing results (e.g., plots)
+├── results/                # Directory for storing results and checkpoints (e.g., metrics)
 ├── run_pbmc3k.py           # Main script to run experiments on PBMC3K
 ├── run_denta.py            # Main script to run experiments on Dentate Gyrus
 ├── main.sh                 # Example shell script for execution
