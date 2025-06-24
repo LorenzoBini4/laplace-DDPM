@@ -49,7 +49,16 @@ The repository is organized as follows:
     cd laplace-DDPM
     ```
 
-2.  **Install dependencies:**
+ 2. **Create and activate the Conda environment:**
+    You may install our dedicated Conda environment directly from the .yml file. This may take a few minutes.
+    ```bash
+    conda env create -f lapddpm.yml
+    ```
+    Once the environment is created, activate it:
+    ```bash
+    conda activate lapddpm
+
+3.  **Install dependencies:**
     The code is built on PyTorch and PyTorch Geometric. We recommend using a virtual environment (like `conda` or `venv`). The required libraries can be installed via `pip`.
 
     ```bash
