@@ -112,7 +112,7 @@ You can execute the script directly from the command line. The `main.sh` script 
 bash main.sh
 ```
 
-This will execute the `run_pbmc3k.py` script, and all standard output and errors will be saved to `scrna_ddpm.out` and `scrna_ddpm.err`, respectively.
+This will execute the `run_pbmc3k.py` script for the Pbmc3k dataset, and all standard output and errors will be saved to `scrna_ddpm.out` and `scrna_ddpm.err`, respectively.
 
 To run the experiment for the Dentate Gyrus dataset, simply modify `main.sh` to call `run_denta.py`.
 
