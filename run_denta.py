@@ -435,14 +435,14 @@ if __name__ == '__main__':
     BATCH_SIZE = 128
     LEARNING_RATE = 3e-3
     EPOCHS = 2500
-    HIDDEN_DIM = 1024
+    HIDDEN_DIM = 512
     LATENT_DIM = 512
     PE_DIM = 20
     K_NEIGHBORS = 15
     PCA_NEIGHBORS = 50
     GENE_THRESHOLD = 20
     TIMESTEPS_DIFFUSION = 1000
-    GLOBAL_SEED = 69
+    GLOBAL_SEED = 77
     set_seed(GLOBAL_SEED)
 
     loss_weights = {'diff': 10.0, 'kl': 0.05, 'rec': 10.0}
