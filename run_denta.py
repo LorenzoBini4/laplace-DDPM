@@ -434,7 +434,7 @@ class Trainer:
 if __name__ == '__main__':
     BATCH_SIZE = 128
     LEARNING_RATE = 3e-3
-    EPOCHS = 2500
+    EPOCHS = 7000 #2500
     HIDDEN_DIM = 512
     LATENT_DIM = 512
     PE_DIM = 20

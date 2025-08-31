@@ -396,8 +396,8 @@ class Trainer:
 
 if __name__ == '__main__':
     BATCH_SIZE = 64 # for DataLoader, but PBMC3KDataset is InMemory, so effectively 1 batch of the whole graph
-    LEARNING_RATE = 1e-3
-    EPOCHS = 1500 
+    LEARNING_RATE = 1e-4 #1e-3
+    EPOCHS = 5000 #1500
     HIDDEN_DIM = 1024
     LATENT_DIM = 1024
     PE_DIM = 50
