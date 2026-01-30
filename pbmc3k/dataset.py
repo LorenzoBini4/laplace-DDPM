@@ -12,16 +12,18 @@ from sklearn.decomposition import PCA
 from .utils import compute_lap_pe
 import torch_geometric
 from torch_geometric.data import download_url, extract_zip
+import warnings
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')   
 class PBMC3KDataset(InMemoryDataset):
-    def __init__(self, h5ad_path, k_neighbors=15, pe_dim=10, root='data/pbmc3k', train=True, gene_threshold=20, pca_neighbors=50):
+    def __init__(self, h5ad_path, k_neighbors=15, pe_dim=10, root='data/pbmc3k', train=True, gene_threshold=20, pca_neighbors=50, seed=42):
         self.h5ad_path = h5ad_path
         self.k_neighbors = k_neighbors
         self.pe_dim = pe_dim
         self.train = train
         self.gene_threshold = gene_threshold
         self.pca_neighbors = pca_neighbors
+        self.seed = seed
         self.filtered_gene_names = []
         self.cell_type_categories = ["Unknown"] # Default
         self.num_cell_types = 1 # Default
@@ -38,10 +40,10 @@ class PBMC3KDataset(InMemoryDataset):
             if os.path.exists(metadata_path): os.remove(metadata_path)
             self.process()
         try:
-            self.data, self.slices = torch.load(self.processed_paths[0])
+            self.data, self.slices = torch.load(self.processed_paths[0], weights_only=False)
             print(f"Successfully loaded processed data from {self.processed_paths[0]}")
             if os.path.exists(metadata_path):
-                metadata = torch.load(metadata_path)
+                metadata = torch.load(metadata_path, weights_only=False)
                 self.filtered_gene_names = metadata.get('filtered_gene_names', [])
                 self.cell_type_categories = metadata.get('cell_type_categories', ["Unknown"])
                 self.num_cell_types = metadata.get('num_cell_types', 1)
@@ -79,41 +81,132 @@ class PBMC3KDataset(InMemoryDataset):
         pass
 
     def process(self):
-        print(f"Processing data from H5AD: {self.h5ad_path} for {'train' if self.train else 'test'} set.")
+        print(f"Processing data from H5/H5AD: {self.h5ad_path} for {'train' if self.train else 'test'} set.")
         print(f"Parameters: k={self.k_neighbors}, PE_dim={self.pe_dim}, Gene Threshold={self.gene_threshold}, PCA Neighbors={self.pca_neighbors}")
 
+        adata = None
+        chromatin_emb = None
+        
         try:
-            adata = sc.read_h5ad(self.h5ad_path)
+            # Check if this is the Raw Multiome H5
+            if self.h5ad_path.endswith(".h5"):
+                print("Detected .h5 file. Assuming 10x Multiome format.")
+                # Suppress "Variable names are not unique" warning
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", message="Variable names are not unique", category=UserWarning)
+                    adata = sc.read_10x_h5(self.h5ad_path, gex_only=False)
+                
+                adata.var_names_make_unique()
+                # 1. Filter Cells (Raw -> ~14k)
+                target_cells = 14500 # Heuristic for "14k sorted nuclei"
+                print(f"Raw data shape: {adata.shape}. Filtering to top {target_cells} cells by counts.")
+                sc.pp.calculate_qc_metrics(adata, inplace=True)
+                cutoff = np.partition(adata.obs['total_counts'], -target_cells)[-target_cells]
+                sc.pp.filter_cells(adata, min_counts=cutoff)
+                sc.pp.filter_cells(adata, min_counts=cutoff)
+                print(f"Filtered data shape: {adata.shape}")
+                
+                # --- TRAIN/TEST SPLIT ---
+                n_total = adata.shape[0]
+                indices = np.arange(n_total)
+                np.random.seed(self.seed) # Use instance seed
+                np.random.shuffle(indices)
+                
+                split_idx = int(0.8 * n_total)
+                if self.train:
+                    indices_to_use = indices[:split_idx]
+                    print(f"SPLIT: Using TRAINING set (first 80%): {len(indices_to_use)} cells.")
+                else:
+                    indices_to_use = indices[split_idx:]
+                    print(f"SPLIT: Using TEST set (last 20%): {len(indices_to_use)} cells.")
+                
+                adata = adata[indices_to_use].copy()
+                # ----------------------------------------
+
+                # 2. Split Modalities
+                print("Splitting Gene Expression and Peaks...")
+                raw_var = adata.var
+                if 'feature_types' in raw_var:
+                    gex_mask = raw_var['feature_types'] == 'Gene Expression'
+                    atac_mask = raw_var['feature_types'] == 'Peaks'
+                else:
+                    # Fallback if feature_types missing (unlikely for 10x h5)
+                    print("Warning: 'feature_types' not found. Assuming all GEX or using var names.")
+                    gex_mask = np.ones(adata.shape[1], dtype=bool) 
+                    atac_mask = np.zeros(adata.shape[1], dtype=bool)
+
+                adata_atac = adata[:, atac_mask].copy()
+                adata = adata[:, gex_mask].copy() # Keep only GEX in main adata
+                print(f"GEX Shape: {adata.shape}, ATAC Shape: {adata_atac.shape}")
+
+                # 3. Process ATAC -> LSI -> Chromatin Embedding
+                if adata_atac.shape[1] > 0:
+                    print("Processing ATAC data with LSI (TF-IDF + SVD)...")
+                    import sklearn.decomposition
+                    from sklearn.feature_extraction.text import TfidfTransformer
+                    
+                    # Binarize
+                    X_atac = adata_atac.X
+                    if sp.issparse(X_atac):
+                        X_atac.data = np.ones_like(X_atac.data)
+                    else:
+                        X_atac[X_atac > 0] = 1
+                    
+                    # TF-IDF
+                    # "Term Frequency" in scATAC is just binary freq, IDF is standard.
+                    tfidf = TfidfTransformer(norm='l2', use_idf=True, smooth_idf=True, sublinear_tf=True)
+                    X_tfidf = tfidf.fit_transform(X_atac)
+                    
+                    # SVD (PCA on sparse without mean centering usually)
+                    # LSI usually means SVD on TF-IDF.
+                    n_components = 50 
+                    svd = sklearn.decomposition.TruncatedSVD(n_components=n_components, random_state=42)
+                    chromatin_emb_np = svd.fit_transform(X_tfidf)
+                    
+                    # Remove 1st component if correlated with depth (standard practice in LSI)
+                    # But for "context embedding" it might be fine. Let's keep all 50.
+                    
+                    chromatin_emb = torch.from_numpy(chromatin_emb_np).float()
+                    print(f"Computed Chromatin Embeddings: {chromatin_emb.shape}")
+                else:
+                    print("No ATAC features found.")
+
+            else:
+                # Standard H5AD (GEX only usually)
+                adata = sc.read_h5ad(self.h5ad_path)
+                
+                # --- TRAIN/TEST SPLIT ---
+                n_total = adata.shape[0]
+                indices = np.arange(n_total)
+                np.random.seed(self.seed) 
+                np.random.shuffle(indices)
+                split_idx = int(0.8 * n_total)
+                
+                if self.train:
+                    indices_to_use = indices[:split_idx]
+                    print(f"SPLIT: Using TRAINING set (first 80%): {len(indices_to_use)} cells.")
+                else:
+                    indices_to_use = indices[split_idx:]
+                    print(f"SPLIT: Using TEST set (last 20%): {len(indices_to_use)} cells.")
+                
+                adata = adata[indices_to_use].copy()
+                # ----------------------------------------
             if not isinstance(adata.X, (np.ndarray, sp.spmatrix)):
                  print(f"Warning: adata.X is of type {type(adata.X)}. Attempting conversion.")
-                 try:
-                     adata.X = sp.csr_matrix(adata.X)
-                 except Exception as e:
-                     print(f"Could not convert adata.X: {e}")
-                     try:
-                         adata.X = np.array(adata.X)
-                     except Exception as e_dense:
-                         print(f"FATAL ERROR: Could not convert adata.X to sparse or dense: {e_dense}"); raise e_dense
+                 try: adata.X = sp.csr_matrix(adata.X)
+                 except: adata.X = np.array(adata.X)
+
         except FileNotFoundError:
-            print(f"FATAL ERROR: H5AD file not found at {self.h5ad_path}"); raise
+            print(f"FATAL ERROR: File not found at {self.h5ad_path}"); raise
         except Exception as e:
-            print(f"FATAL ERROR reading H5AD file {self.h5ad_path}: {e}"); traceback.print_exc(); raise
+            print(f"FATAL ERROR reading file {self.h5ad_path}: {e}"); traceback.print_exc(); raise
 
         counts = adata.X
         num_cells, initial_num_genes = counts.shape
-        print(f"Initial data shape: {num_cells} cells, {initial_num_genes} genes.")
+        print(f"Initial GEX data shape: {num_cells} cells, {initial_num_genes} genes.")
 
         if num_cells == 0 or initial_num_genes == 0:
              print("Warning: Input data is empty. Creating empty Data object.")
-             data = Data(x=torch.empty((0, initial_num_genes), dtype=torch.float),
-                         edge_index=torch.empty((2,0), dtype=torch.long),
-                         cell_type=torch.empty(0, dtype=torch.long),
-                         lap_pe=torch.empty((0, self.pe_dim), dtype=torch.float),
-                         num_nodes=0)
-             data_list = [data]
-             data_to_save, slices_to_save = self.collate(data_list)
-             torch.save((data_to_save, slices_to_save), self.processed_paths[0])
-             print(f"Processed and saved empty data to {self.processed_paths[0]}")
              return
 
         print(f"Filtering genes expressed in fewer than {self.gene_threshold} cells.")
@@ -126,28 +219,17 @@ class PBMC3KDataset(InMemoryDataset):
             genes_expressed_count = np.count_nonzero(counts, axis=0)
             genes_to_keep_mask = genes_expressed_count >= self.gene_threshold
             counts = counts[:, genes_to_keep_mask]
-            if hasattr(adata, 'var_names') and adata.var_names is not None and len(adata.var_names) == initial_num_genes:
-                 self.filtered_gene_names = [adata.var_names[i] for i, keep in enumerate(genes_to_keep_mask) if keep]
-            else:
-                 print("Warning: Could not retrieve gene names from adata.var_names for filtered genes.")
-                 self.filtered_gene_names = [f'gene_{i}' for i in np.where(genes_to_keep_mask)[0]]
+            if hasattr(adata, 'var_names'): self.filtered_gene_names = [adata.var_names[i] for i, k in enumerate(genes_to_keep_mask) if k]
+            else: self.filtered_gene_names = [f'gene_{i}' for i in np.where(genes_to_keep_mask)[0]]
 
         num_genes_after_filtering = counts.shape[1]
         print(f"Number of genes after filtering: {num_genes_after_filtering}")
-
-        if num_genes_after_filtering == 0:
-            print("FATAL ERROR: All genes filtered out. Creating empty Data object.")
-            self.filtered_gene_names = []
-            data = Data(x=torch.empty((num_cells, 0), dtype=torch.float),
-                        edge_index=torch.empty((2,0), dtype=torch.long),
-                        cell_type=torch.empty(num_cells, dtype=torch.long),
-                        lap_pe=torch.empty((num_cells, self.pe_dim), dtype=torch.float),
-                        num_nodes=num_cells)
-            data_list = [data]
-            data_to_save, slices_to_save = self.collate(data_list)
-            torch.save((data_to_save, slices_to_save), self.processed_paths[0])
-            print(f"Processed and saved empty data to {self.processed_paths[0]}")
-            return
+        
+        # Check if chromatin_emb exists and matches num_cells (it should if we filtered same adata)
+        if chromatin_emb is not None:
+             if chromatin_emb.size(0) != num_cells:
+                 print(f"Warning: Chromatin embedding size {chromatin_emb.size(0)} != num_cells {num_cells}. This implies filtering mismatch.")
+                 chromatin_emb = None
 
         if 'cell_type' not in adata.obs.columns:
              print("Warning: 'cell_type' not found in adata.obs.columns. Proceeding without cell type labels.")
@@ -157,39 +239,38 @@ class PBMC3KDataset(InMemoryDataset):
         else:
             cell_type_series = adata.obs['cell_type']
             if not pd.api.types.is_categorical_dtype(cell_type_series):
-                 try:
-                     cell_type_series = cell_type_series.astype('category')
-                 except Exception as e:
-                      print(f"Error converting cell_type to categorical: {e}. Using raw values.")
-                      try:
-                           unique_types, cell_type_labels = np.unique(cell_type_series.values, return_inverse=True)
-                           num_cell_types = len(unique_types)
-                           cell_type_categories = unique_types.tolist()
-                           print(f"Found {num_cell_types} cell types (processed as inverse indices).")
-                      except Exception as e_inv:
-                           print(f"FATAL ERROR: Could not process cell types as categorical or inverse indices: {e_inv}"); traceback.print_exc(); raise e_inv
-            else:
+                 try: cell_type_series = cell_type_series.astype('category')
+                 except: pass # fallback
+            
+            if pd.api.types.is_categorical_dtype(cell_type_series):
                 cell_type_labels = cell_type_series.cat.codes.values
                 num_cell_types = len(cell_type_series.cat.categories)
                 cell_type_categories = cell_type_series.cat.categories.tolist()
-                print(f"Found {num_cell_types} cell types.")
+            else:
+                 unique_types, cell_type_labels = np.unique(cell_type_series.values, return_inverse=True)
+                 num_cell_types = len(unique_types)
+                 cell_type_categories = unique_types.tolist()
 
         self.num_cell_types = num_cell_types
         self.cell_type_categories = cell_type_categories
 
-        edge_index = torch.empty((2,0), dtype=torch.long)
+        edge_index_feat = torch.empty((2,0), dtype=torch.long)
+        edge_index_phys = torch.empty((2,0), dtype=torch.long)
+        pos = torch.zeros((num_cells, 2), dtype=torch.float)
         lap_pe = torch.zeros((num_cells, self.pe_dim), dtype=torch.float)
 
+        # 1. Build FEATURE Graph (Gene Expression Space)
         if num_cells > 1 and self.k_neighbors > 0 and num_genes_after_filtering > 0:
             actual_k_for_knn = min(self.k_neighbors, num_cells - 1)
-            print(f"Building KNN graph with k={actual_k_for_knn} on {num_cells} cells based on PCA-reduced expression.")
+            print(f"Building FEATURE graph (k={actual_k_for_knn}) on PCA-reduced expression.")
             pca_input = counts
             if sp.issparse(pca_input):
                 try:
-                    print("Converting sparse counts to dense for PCA.")
+                    # print("Converting sparse counts to dense for PCA.") 
+                    # Use chunked/incremental PCA if needed for huge datasets, but validation sets are usually ok.
                     pca_input_dense = pca_input.toarray()
                 except Exception as e:
-                     print(f"Error converting sparse to dense for PCA: {e}. Using raw counts for KNN."); traceback.print_exc()
+                     print(f"Error converting sparse to dense for PCA: {e}. Using raw counts."); traceback.print_exc()
                      pca_input_dense = counts
             else:
                  pca_input_dense = pca_input
@@ -201,57 +282,85 @@ class PBMC3KDataset(InMemoryDataset):
                      try:
                          pca = PCA(n_components=n_components_pca, random_state=0)
                          pca_coords = pca.fit_transform(pca_input_dense)
-                         print(f"PCA reduced data shape: {pca_coords.shape}")
                      except Exception as e:
-                         print(f"Error during PCA for KNN graph: {e}. Using raw counts for KNN."); traceback.print_exc()
+                         print(f"Error during PCA: {e}. Using raw counts."); 
                          pca_coords = pca_input_dense
                  else:
-                      print("Warning: PCA components <= 0. Using raw counts for KNN.")
                       pca_coords = pca_input_dense
-            else:
-                 print("Warning: Cannot perform PCA or KNN. Insufficient cells or features.")
-
+            
             knn_input_coords = pca_coords if pca_coords is not None else pca_input_dense
-            if knn_input_coords is not None and knn_input_coords.shape[0] > 1 and actual_k_for_knn > 0 and knn_input_coords.shape[1] > 0:
+            if knn_input_coords is not None and knn_input_coords.shape[0] > 1:
                 try:
                     nbrs = NearestNeighbors(n_neighbors=actual_k_for_knn + 1, algorithm='auto', metric='euclidean').fit(knn_input_coords)
                     distances, indices = nbrs.kneighbors(knn_input_coords)
                     source_nodes = np.repeat(np.arange(num_cells), actual_k_for_knn)
                     target_nodes = indices[:, 1:].flatten()
                     edges = np.stack([source_nodes, target_nodes], axis=0)
-                    edge_index = torch.tensor(edges, dtype=torch.long)
-                    edge_index = torch_geometric.utils.to_undirected(edge_index, num_nodes=num_cells)
-                    edge_index, _ = torch_geometric.utils.remove_self_loops(edge_index)
-                    print(f"KNN graph built with {edge_index.size(1)} edges.")
+                    edge_index_feat = torch.tensor(edges, dtype=torch.long)
+                    edge_index_feat = to_undirected(edge_index_feat, num_nodes=num_cells)
+                    edge_index_feat, _ = remove_self_loops(edge_index_feat)
+                    print(f"FEATURE Graph built: {edge_index_feat.size(1)} edges.")
                 except Exception as e:
-                    print(f"Error during KNN graph construction: {e}. Creating empty graph."); traceback.print_exc()
-                    edge_index = torch.empty((2,0), dtype=torch.long)
-            else:
-                 print("Warning: Cannot build KNN graph. Creating empty graph.")
-                 edge_index = torch.empty((2,0), dtype=torch.long)
+                    print(f"Error building FEATURE graph: {e}."); traceback.print_exc()
 
-            if num_cells > 0 and edge_index.numel() > 0:
-                 print(f"Computing Laplacian PE with dim {self.pe_dim} for {num_cells} nodes.")
-                 try:
-                     lap_pe = compute_lap_pe(edge_index.cpu(), num_cells, k=self.pe_dim).to(device)
-                     lap_pe = lap_pe.to(torch.float32)
-                 except Exception as e:
-                      print(f"Error computing Laplacian PE: {e}. Returning zero PEs."); traceback.print_exc()
-                      lap_pe = torch.zeros((num_cells, self.pe_dim), device=device, dtype=torch.float32)
-            else:
-                 print("Skipping Laplacian PE computation.")
-                 lap_pe = torch.zeros((num_cells, self.pe_dim), device=device, dtype=torch.float32)
+        # 2. Build PHYSICAL Graph (Spatial Space)
+        if 'spatial' in adata.obsm:
+            print(f"Building PHYSICAL graph (k={self.k_neighbors}) on Spatial Coordinates.")
+            spatial_coords = adata.obsm['spatial']
+            pos = torch.from_numpy(spatial_coords).float()
+            
+            try:
+                # Constructing Spatial KNN.
+                nbrs_phys = NearestNeighbors(n_neighbors=self.k_neighbors + 1, algorithm='auto', metric='euclidean').fit(spatial_coords)
+                _, indices_phys = nbrs_phys.kneighbors(spatial_coords)
+                source_phys = np.repeat(np.arange(num_cells), self.k_neighbors)
+                target_phys = indices_phys[:, 1:].flatten()
+                
+                edges_phys = np.stack([source_phys, target_phys], axis=0)
+                edge_index_phys = torch.tensor(edges_phys, dtype=torch.long)
+                edge_index_phys = to_undirected(edge_index_phys, num_nodes=num_cells)
+                edge_index_phys, _ = remove_self_loops(edge_index_phys)
+                print(f"PHYSICAL Graph built: {edge_index_phys.size(1)} edges.")
+                
+            except Exception as e:
+                print(f"Error building PHYSICAL graph: {e}."); traceback.print_exc()
+        else:
+            print("No 'spatial' in obsm. PHYSICAL graph will be empty.")
 
+        target_graph_for_pe = edge_index_feat if edge_index_feat.numel() > 0 else edge_index_phys
+        
+        if num_cells > 0 and target_graph_for_pe.numel() > 0:
+             print(f"Computing Laplacian PE with dim {self.pe_dim}...")
+             try:
+                 lap_pe = compute_lap_pe(target_graph_for_pe.cpu(), num_cells, k=self.pe_dim).to(device)
+                 lap_pe = lap_pe.to(torch.float32)
+             except Exception as e:
+                  print(f"Error computing PE: {e}."); traceback.print_exc()
+        
         if sp.issparse(counts):
             x = torch.from_numpy(counts.toarray().copy()).float()
         else:
             x = torch.from_numpy(counts.copy()).float()
         cell_type = torch.from_numpy(cell_type_labels.copy()).long()
-        data = Data(x=x, edge_index=edge_index, lap_pe=lap_pe, cell_type=cell_type, num_nodes=num_cells)
+        
+        if chromatin_emb is None:
+             chromatin_emb = torch.zeros((num_cells, 0), dtype=torch.float)
+
+        # Save both graphs in Data object
+        # edge_index (standard) will be FEATURE graph. edge_index_phys will be PHYSICAL.
+        data = Data(x=x, 
+                    edge_index=edge_index_feat, 
+                    edge_index_phys=edge_index_phys,
+                    pos=pos,
+                    lap_pe=lap_pe, 
+                    cell_type=cell_type,
+                    chromatin=chromatin_emb, # Added Chromatin Embedding
+                    num_nodes=num_cells)
 
         if data.x.size(0) != num_cells: print(f"Warning: Data.x size mismatch.")
         if data.lap_pe.size(0) != num_cells: print(f"Warning: Data.lap_pe size mismatch.")
         if data.cell_type.size(0) != num_cells: print(f"Warning: Data.cell_type size mismatch.")
+        if data.chromatin.size(0) != num_cells: print(f"Warning: Data.chromatin size mismatch.")
         if data.edge_index.numel() > 0 and data.edge_index.max() >= num_cells: print(f"Warning: Edge index out of bounds.")
 
         data_list = [data]
@@ -262,7 +371,8 @@ class PBMC3KDataset(InMemoryDataset):
             metadata = {
                 'filtered_gene_names': self.filtered_gene_names,
                 'cell_type_categories': self.cell_type_categories,
-                'num_cell_types': self.num_cell_types
+                'num_cell_types': self.num_cell_types,
+                'context_dim': chromatin_emb.size(1) # Save context dim
             }
             metadata_path = self.processed_paths[0].replace(".pt", "_metadata.pt")
             torch.save(metadata, metadata_path)

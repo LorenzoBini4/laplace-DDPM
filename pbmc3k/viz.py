@@ -6,10 +6,8 @@ import anndata as ad
 import matplotlib.pyplot as plt
 import seaborn as sns
 import scipy.sparse as sp
-# Ensure that the plotting libraries are set up correctly
 from typing import List, Union
 
-# Set plotting style for consistent aesthetics
 def set_plotting_style():
     """
     Set the plotting style for matplotlib and seaborn.
@@ -101,6 +99,7 @@ def generate_qualitative_plots(real_adata_filtered, generated_counts, generated_
     if real_counts_np.shape[0] > 0 and real_counts_np.shape[1] > 0:
         adata_real_processed = real_adata_filtered.copy()
         adata_real_processed.var_names = [str(name) for name in adata_real_processed.var_names] # ensure var_names are strings
+        adata_real_processed.var_names_make_unique()
 
         if 'cell_type' in adata_real_processed.obs:
             if isinstance(adata_real_processed.obs['cell_type'].dtype, pd.CategoricalDtype):
@@ -191,6 +190,7 @@ def generate_qualitative_plots(real_adata_filtered, generated_counts, generated_
             var=pd.DataFrame(index=var_names_for_gen)
         )
         adata_gen_processed.var_names = [str(name) for name in adata_gen_processed.var_names] # ensure var_names are strings
+        adata_gen_processed.var_names_make_unique()
 
         # UMAP pipeline for generated data
         sc.pp.normalize_total(adata_gen_processed, target_sum=1e4)
@@ -227,7 +227,11 @@ def generate_qualitative_plots(real_adata_filtered, generated_counts, generated_
 
                     # plot Generated Data UMAP
                     plt.figure(figsize=(8, 8))
-                    sc.pl.umap(adata_gen_hvg, color='cell_type_str_umap',
+                    color_key_gen = 'cell_type_str_umap'
+                    if color_key_gen not in adata_gen_hvg.obs.columns:
+                         color_key_gen = None 
+                    
+                    sc.pl.umap(adata_gen_hvg, color=color_key_gen,
                                frameon=False, legend_fontsize=8, legend_loc='on data', show=False,
                                title=f"UMAP of Generated ({model_name}) Cell Types",
                                save=f"_figure2_umap_gen_{model_name.replace(' ', '_')}.png")

@@ -56,11 +56,19 @@ class LaplacianPerturb:
         return perturbed_weights.clamp(min=1e-4, max=10.0)
 
 class SpectralEncoder(nn.Module):
-    def __init__(self, in_dim, hid_dim, lat_dim, pe_dim):
+    def __init__(self, in_dim, hid_dim, lat_dim, pe_dim, num_layers=2):
         super().__init__()
         self.pe_dim = pe_dim
-        self.cheb1 = ChebConv(in_dim + pe_dim, hid_dim, K=4)
-        self.cheb2 = ChebConv(hid_dim, hid_dim, K=4)
+        self.num_layers = num_layers
+        self.convs = nn.ModuleList()
+        
+        # First layer
+        self.convs.append(ChebConv(in_dim + pe_dim, hid_dim, K=4))
+        
+        # Hidden layers
+        for _ in range(num_layers - 1):
+            self.convs.append(ChebConv(hid_dim, hid_dim, K=4))
+            
         self.mu_net = nn.Linear(hid_dim, lat_dim)
         self.logvar_net = nn.Linear(hid_dim, lat_dim)
 
@@ -89,39 +97,63 @@ class SpectralEncoder(nn.Module):
             if edge_weight_sl.device != current_device: edge_weight_sl = edge_weight_sl.to(current_device)
             if edge_weight_sl.dtype != x_combined.dtype: edge_weight_sl = edge_weight_sl.to(x_combined.dtype)
 
-        h = F.relu(self.cheb1(x_combined, edge_index_sl, edge_weight_sl))
-        h = F.relu(self.cheb2(h, edge_index_sl, edge_weight_sl))
+        h = x_combined
+        for conv in self.convs:
+            h = F.relu(conv(h, edge_index_sl, edge_weight_sl))
+            
         mu = self.mu_net(h)
         logvar = self.logvar_net(h)
         return mu, logvar
 
 class ScoreNet(nn.Module):
-    def __init__(self, lat_dim, num_cell_types, time_embed_dim=32, hid_dim_mlp=512): # Added hid_dim_mlp
+    def __init__(self, lat_dim, num_cell_types, time_embed_dim=32, hid_dim_mlp=512, context_dim=0, num_layers=3): 
         super().__init__()
         self.lat_dim = lat_dim
         self.num_cell_types = num_cell_types
         self.time_embed_dim = time_embed_dim
+        self.context_dim = context_dim
 
         self.time_mlp = nn.Sequential(
             nn.Linear(1, time_embed_dim),
             nn.ReLU(),
             nn.Linear(time_embed_dim, time_embed_dim)
         )
+        
+        # Discrete Cell Type Embedding (Legacy/Standard)
         self.cell_type_embed = nn.Embedding(num_cell_types, time_embed_dim)
 
+        # Continuous Context Embedding (New: for scATAC-seq / Multimodal)
+        if context_dim > 0:
+            self.context_mlp = nn.Sequential(
+                nn.Linear(context_dim, time_embed_dim),
+                nn.ReLU(),
+                nn.Linear(time_embed_dim, time_embed_dim)
+            )
+        else:
+            self.context_mlp = None
+
         # MLP with LayerNorm
-        self.mlp = nn.Sequential(
-            nn.Linear(lat_dim + time_embed_dim + time_embed_dim, hid_dim_mlp),
-            nn.LayerNorm(hid_dim_mlp), # Added LayerNorm
-            nn.ReLU(),
-            nn.Linear(hid_dim_mlp, hid_dim_mlp),
-            nn.LayerNorm(hid_dim_mlp), # Added LayerNorm
-            nn.ReLU(),
-            nn.Linear(hid_dim_mlp, lat_dim)
-        )
+        layers = []
+        input_dim = lat_dim + time_embed_dim + time_embed_dim
+        
+        # 1st Layer: Input -> Hidden
+        layers.append(nn.Linear(input_dim, hid_dim_mlp))
+        layers.append(nn.LayerNorm(hid_dim_mlp))
+        layers.append(nn.ReLU())
+        
+        # Hidden Layers: Hidden -> Hidden
+        for _ in range(num_layers - 2):
+            layers.append(nn.Linear(hid_dim_mlp, hid_dim_mlp))
+            layers.append(nn.LayerNorm(hid_dim_mlp))
+            layers.append(nn.ReLU())
+            
+        # Last Layer: Hidden -> Output
+        layers.append(nn.Linear(hid_dim_mlp, lat_dim))
+        
+        self.mlp = nn.Sequential(*layers)
         self.cond_drop_prob = 0.1
 
-    def forward(self, zt, time_t, cell_type_labels=None):
+    def forward(self, zt, time_t, cell_type_labels=None, context_embedding=None):
         current_device = zt.device
         num_nodes = zt.size(0)
         if num_nodes == 0:
@@ -147,23 +179,34 @@ class ScoreNet(nn.Module):
 
         time_embedding = self.time_mlp(time_t_processed)
 
-        if cell_type_labels is not None:
-            if cell_type_labels.ndim == 0: cell_type_labels = cell_type_labels.unsqueeze(0)
-            if cell_type_labels.size(0) != num_nodes and num_nodes > 0:
-                raise ValueError(f"Batch size mismatch for cell_type_labels and zt")
-            is_dropout = self.training and torch.rand(1).item() < self.cond_drop_prob
-            if is_dropout:
-                cell_type_embedding = torch.zeros(num_nodes, self.time_embed_dim, device=current_device, dtype=zt.dtype)
-            else:
+        # Handle Conditioning
+        cond_embedding = torch.zeros(num_nodes, self.time_embed_dim, device=current_device, dtype=zt.dtype)
+        
+        # Check for dropout
+        is_dropout = self.training and torch.rand(1).item() < self.cond_drop_prob
+        
+        if not is_dropout:
+            # Prioritize Continuous Context if provided (Multimodal)
+            if context_embedding is not None and self.context_mlp is not None:
+                if context_embedding.size(0) != num_nodes:
+                     if context_embedding.size(0) == 1: context_embedding = context_embedding.repeat(num_nodes, 1)
+                     else: raise ValueError(f"Context embedding batch mismatch")
+                cond_embedding = self.context_mlp(context_embedding)
+            
+            # Fallback to Discrete Cell Type
+            elif cell_type_labels is not None:
+                if cell_type_labels.ndim == 0: cell_type_labels = cell_type_labels.unsqueeze(0)
+                if cell_type_labels.size(0) != num_nodes and num_nodes > 0:
+                     if cell_type_labels.size(0) == 1: cell_type_labels = cell_type_labels.repeat(num_nodes)
+                     else: raise ValueError(f"Batch size mismatch for cell_type_labels")
+                
                 if cell_type_labels.max() >= self.num_cell_types or cell_type_labels.min() < 0:
                     cell_type_labels_clamped = torch.clamp(cell_type_labels, 0, self.num_cell_types - 1)
-                    cell_type_embedding = self.cell_type_embed(cell_type_labels_clamped)
+                    cond_embedding = self.cell_type_embed(cell_type_labels_clamped)
                 else:
-                    cell_type_embedding = self.cell_type_embed(cell_type_labels)
-        else:
-            cell_type_embedding = torch.zeros(num_nodes, self.time_embed_dim, device=current_device, dtype=zt.dtype)
+                    cond_embedding = self.cell_type_embed(cell_type_labels)
 
-        combined_input = torch.cat([zt, time_embedding, cell_type_embedding], dim=1)
+        combined_input = torch.cat([zt, time_embedding, cond_embedding], dim=1)
         score_val = self.mlp(combined_input)
         return score_val
 
@@ -183,7 +226,7 @@ class ScoreSDE(nn.Module):
         return torch.sqrt(1. - torch.exp(-2 * t) + 1e-8)
 
     @torch.no_grad()
-    def sample(self, z_shape, cell_type_labels=None):
+    def sample(self, z_shape, cell_type_labels=None, context_embedding=None):
         current_device = self.timesteps.device
         num_samples, lat_dim = z_shape
         if num_samples == 0: return torch.empty(z_shape, device=current_device, dtype=torch.float32)
@@ -195,12 +238,16 @@ class ScoreSDE(nn.Module):
             if cell_type_labels.device != current_device: cell_type_labels = cell_type_labels.to(current_device)
             if cell_type_labels.size(0) == 1 and num_samples > 1: cell_type_labels = cell_type_labels.repeat(num_samples)
             elif cell_type_labels.size(0) != num_samples: raise ValueError(f"Cell type labels size mismatch")
+        
+        if context_embedding is not None:
+            if context_embedding.device != current_device: context_embedding = context_embedding.to(current_device)
+            if context_embedding.size(0) == 1 and num_samples > 1: context_embedding = context_embedding.repeat(num_samples, 1)
 
         for i in range(self.N):
             t_val_float = self.timesteps[i].item()
             t_tensor_for_model = torch.full((num_samples,), t_val_float, device=current_device, dtype=z.dtype)
             sigma_t = self.marginal_std(t_val_float)
-            predicted_epsilon = self.score_model(z, t_tensor_for_model, cell_type_labels)
+            predicted_epsilon = self.score_model(z, t_tensor_for_model, cell_type_labels, context_embedding=context_embedding)
             sigma_t_safe = sigma_t + 1e-8
             drift = 2 * predicted_epsilon / sigma_t_safe
             diffusion_coeff_input = torch.tensor(2 * dt + 1e-8, device=current_device, dtype=z.dtype)
@@ -208,18 +255,85 @@ class ScoreSDE(nn.Module):
             z = z + drift * dt + diffusion_coeff * torch.randn_like(z)
         return z
 
+    def sample_guided(self, z_shape, guidance_fn, cell_type_labels=None, context_embedding=None, guidance_scale=1.0):
+        """
+        Samples with gradient-based guidance (e.g. for Inverse Problems / Inpainting).
+        guidance_fn: callable(z_t, t_val) -> grad_term (tensor of shape z)
+                     Should calculate gradient of log-likelihood of observation given latent.
+        """
+        current_device = self.timesteps.device
+        num_samples, lat_dim = z_shape
+        if num_samples == 0: return torch.empty(z_shape, device=current_device, dtype=torch.float32)
+
+        z = torch.randn(z_shape, device=current_device, dtype=torch.float32)
+        dt = self.T / self.N
+
+        if cell_type_labels is not None:
+            if cell_type_labels.device != current_device: cell_type_labels = cell_type_labels.to(current_device)
+            if cell_type_labels.size(0) == 1 and num_samples > 1: cell_type_labels = cell_type_labels.repeat(num_samples)
+
+        if context_embedding is not None:
+            if context_embedding.device != current_device: context_embedding = context_embedding.to(current_device)
+            if context_embedding.size(0) == 1 and num_samples > 1: context_embedding = context_embedding.repeat(num_samples, 1)
+
+        for i in range(self.N):
+            t_val_float = self.timesteps[i].item()
+            t_tensor_for_model = torch.full((num_samples,), t_val_float, device=current_device, dtype=z.dtype)
+            
+            # Enable grad for guidance calculation
+            with torch.enable_grad():
+                z_in = z.detach().requires_grad_(True)
+                
+                # Predict score / epsilon
+                sigma_t = self.marginal_std(t_val_float)
+                predicted_epsilon = self.score_model(z_in, t_tensor_for_model, cell_type_labels, context_embedding=context_embedding) 
+                alpha_t = torch.exp(torch.tensor(-t_val_float, device=current_device))
+                z0_hat = (z_in - sigma_t * predicted_epsilon) / (alpha_t + 1e-8)
+                
+                # Calculate Guidance Gradient
+                # We want to push z_t towards high likelihood region.
+                # score_modified = score_uncond + scale * grad_guidance
+                grad_guidance = guidance_fn(z0_hat, t_val_float)
+            
+            with torch.no_grad():
+                # Apply guidance to the score/eps
+                # eps_modified = eps - sigma_t * grad_guidance (derived from score eq)
+                # score = -eps/sigma. score_new = score + grad.
+                # -eps_new/sigma = -eps/sigma + grad => eps_new = eps - sigma * grad
+                
+                predicted_epsilon_final = predicted_epsilon - sigma_t * grad_guidance * guidance_scale
+
+                # Standard Reverse Step with modified epsilon
+                sigma_t_safe = sigma_t + 1e-8
+                drift = 2 * predicted_epsilon_final / sigma_t_safe
+                diffusion_coeff_input = torch.tensor(2 * dt + 1e-8, device=current_device, dtype=z.dtype)
+                diffusion_coeff = torch.sqrt(diffusion_coeff_input)
+                
+                z = z + drift * dt + diffusion_coeff * torch.randn_like(z)
+                z = z.detach()
+
+        return z
+
 class FeatureDecoder(nn.Module):
-    def __init__(self, lat_dim, hid_dim, out_dim): # hid_dim is used for MLP layers
+    def __init__(self, lat_dim, hid_dim, out_dim, num_layers=3): # hid_dim is used for MLP layers
         super().__init__()
-        self.decoder_mlp = nn.Sequential(
-            nn.Linear(lat_dim, hid_dim),
-            nn.LayerNorm(hid_dim), # Added LayerNorm
-            nn.ReLU(),
-            nn.Linear(hid_dim, hid_dim),
-            nn.LayerNorm(hid_dim), # Added LayerNorm
-            nn.ReLU(),
-            nn.Linear(hid_dim, 2 * out_dim) # Output 2 * out_dim for log_mu and log_theta
-        )
+        layers = []
+        
+        # 1st Layer: Input -> Hidden
+        layers.append(nn.Linear(lat_dim, hid_dim))
+        layers.append(nn.LayerNorm(hid_dim))
+        layers.append(nn.ReLU())
+        
+        # Hidden Layers: Hidden -> Hidden
+        for _ in range(num_layers - 2):
+            layers.append(nn.Linear(hid_dim, hid_dim))
+            layers.append(nn.LayerNorm(hid_dim))
+            layers.append(nn.ReLU())
+            
+        # Last Layer: Hidden -> Output
+        layers.append(nn.Linear(hid_dim, 2 * out_dim)) # Output 2 * out_dim for log_mu and log_theta
+        
+        self.decoder_mlp = nn.Sequential(*layers)
         self.out_dim = out_dim # Store out_dim
 
     def forward(self, z):
