@@ -3,6 +3,7 @@ import torch
 import scipy.sparse as sp
 from scipy.sparse.linalg import eigsh
 import traceback
+from torch_scatter import scatter_add
 
 # Helper function for Laplacian PE
 def compute_lap_pe(edge_index, num_nodes, k=10):
@@ -100,3 +101,34 @@ def compute_lap_pe_batch_list(edge_index_list, num_nodes_list, k=10):
 
     pe_list = [compute_lap_pe_batch(edge_index, num_nodes, k) for edge_index, num_nodes in zip(edge_index_list, num_nodes_list)]
     return torch.cat(pe_list, dim=0)    
+
+# ---------------------------------------------
+# Graph utility for spectral alignment losses
+# ---------------------------------------------
+def laplacian_smooth(node_features, edge_index, edge_weight=None, eps: float = 1e-6):
+    """
+    One-step symmetric Laplacian smoothing used to align representations across graphs.
+    Args:
+        node_features (Tensor): [N, D]
+        edge_index (LongTensor): [2, E]
+        edge_weight (Tensor or None): [E]
+        eps (float): numerical stability
+    Returns:
+        Tensor: Smoothed features with same shape as node_features.
+    """
+    if node_features.numel() == 0 or edge_index.numel() == 0:
+        return torch.zeros_like(node_features)
+
+    num_nodes = node_features.size(0)
+    device = node_features.device
+    if edge_weight is None:
+        edge_weight = torch.ones(edge_index.size(1), device=device, dtype=node_features.dtype)
+
+    row, col = edge_index
+    deg = scatter_add(edge_weight, row, dim=0, dim_size=num_nodes)
+    deg_inv_sqrt = torch.pow(deg + eps, -0.5)
+    norm = deg_inv_sqrt[row] * edge_weight * deg_inv_sqrt[col]
+
+    messages = node_features[col] * norm.unsqueeze(-1)
+    smoothed = scatter_add(messages, row, dim=0, dim_size=num_nodes)
+    return smoothed

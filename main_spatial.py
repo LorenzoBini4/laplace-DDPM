@@ -11,16 +11,16 @@ import os
 import traceback
 import scanpy as sc
 from sklearn.decomposition import PCA
-from scipy.spatial.distance import cdist # For pairwise distances in Wasserstein and MMD
-import sys # For checking installed modules
-import torch.distributions as dist # Import for Negative Binomial distribution
-from pbmc3k.seed import *
-from pbmc3k.utils import * 
-from pbmc3k.dataset import*
-from pbmc3k.models import *
-from pbmc3k.viz import *
-
-# Check for required libraries
+from scipy.spatial.distance import cdist 
+import sys 
+import torch.distributions as dist 
+from laplace.seed import *
+from laplace.utils import * 
+from laplace.dataset import*
+from laplace.models import *
+from laplace.viz import *
+import gc
+from tqdm import tqdm
 try:
     import torch
     import torch_geometric
@@ -31,32 +31,131 @@ try:
     import numpy
     import sklearn
     import scipy
-    import ot # Python Optimal Transport library
-    import leidenalg # For fallback clustering
+    import leidenalg 
 except ImportError as e:
     print(f"Missing required library: {e}. Please install it using pip.")
-    # print("Example: pip install torch torch-geometric torch-scatter scanpy anndata pandas numpy scikit-learn scipy POT leidenalg")
     pass 
 
-class Trainer:
-    def __init__(self, in_dim, hid_dim, lat_dim, num_cell_types, pe_dim, timesteps, lr, warmup_steps, total_steps, loss_weights=None, input_masking_fraction=0.0): # Added input_masking_fraction
-        print("\nInitializing Trainer...")
-        self.encoder = SpectralEncoder(in_dim, hid_dim, lat_dim, pe_dim=pe_dim).to(device)
-        # Pass hid_dim for ScoreNet's internal MLP, can be different from GNN hid_dim
-        self.denoiser = ScoreNet(lat_dim, num_cell_types=num_cell_types, time_embed_dim=32, hid_dim_mlp=hid_dim).to(device)
-        self.decoder = FeatureDecoder(lat_dim, hid_dim, in_dim).to(device) # Pass hid_dim for decoder's MLP
-        self.diff = ScoreSDE(self.denoiser, T=1.0, N=timesteps).to(device)
-        self.lap_pert = LaplacianPerturb()
-        self.all_params = list(self.encoder.parameters()) + list(self.denoiser.parameters()) + list(self.decoder.parameters())
-        self.optim = torch.optim.Adam(self.all_params, lr=lr)
-        self.scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
-        self.current_step = 0
-        self.input_masking_fraction = input_masking_fraction # Store masking fraction
+def sliced_wasserstein_gpu(X, Y, num_projections=50, seed=42):
+    """
+    Computes Sliced Wasserstein Distance (SWD) between two high-dimensional distributions X and Y on GPU.
+    X, Y: (N, D) tensors
+    """
+    device = X.device
+    dim = X.shape[1]
+    
+    torch.manual_seed(seed)
+    
+    projections = torch.randn(dim, num_projections, device=device)
+    projections = F.normalize(projections, p=2, dim=0) # Normalize columns
+    
+    X_proj = X @ projections # (N, num_projections)
+    Y_proj = Y @ projections
+    
+    X_sorted, _ = torch.sort(X_proj, dim=0)
+    Y_sorted, _ = torch.sort(Y_proj, dim=0)
+    
+    wdists = torch.abs(X_sorted - Y_sorted).mean(dim=0) 
+    return wdists.mean().item()
 
-        if loss_weights is None: self.loss_weights = {'diff': 1.0, 'kl': 0.01, 'rec': 1.0} # Adjusted KL and Rec weights for NB
+def rbf_mmd_gpu(X, Y, scales=[0.1, 1.0, 10.0]):
+    """
+    Computes RBF MMD between two sets of samples X and Y on GPU to avoid OOM.
+    X, Y: (N, D) tensors
+    """
+    if X.size(0) > 5000:
+        idx_x = torch.randperm(X.size(0))[:5000]
+        X = X[idx_x]
+    if Y.size(0) > 5000:
+        idx_y = torch.randperm(Y.size(0))[:5000]
+        Y = Y[idx_y]
+        
+    device = X.device
+    min_size = min(X.size(0), Y.size(0))
+    X = X[:min_size] # Equal sizes for simplicity in some MMD var implementations, though not strictly needed
+    Y = Y[:min_size]
+    
+    # Efficient Distance Matrix computation: |x-y|^2 = x^2 + y^2 - 2xy
+    xx = torch.mm(X, X.t())
+    yy = torch.mm(Y, Y.t())
+    xy = torch.mm(X, Y.t())
+    
+    rx = xx.diag().unsqueeze(0).expand_as(xx)
+    ry = yy.diag().unsqueeze(0).expand_as(yy)
+    
+    dxx = rx.t() + rx - 2.*xx
+    dyy = ry.t() + ry - 2.*yy
+    dxy = rx.t() + ry - 2.*xy
+    
+    results = {}
+    for scale in scales:
+        gamma = 1.0 / (2 * scale)
+        K_xx = torch.exp(-gamma * dxx)
+        K_yy = torch.exp(-gamma * dyy)
+        K_xy = torch.exp(-gamma * dxy)
+        
+        mmd = K_xx.mean() + K_yy.mean() - 2 * K_xy.mean()
+        results[scale] = mmd.item()
+        
+    return results
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+class Trainer:
+    def __init__(self, in_dim, hid_dim, lat_dim, num_cell_types, pe_dim, timesteps, max_time, lr, warmup_steps, total_steps,
+                 loss_weights=None, input_masking_fraction=0.0, context_dim=0,
+                 dual_graph=True, spectral_loss_weight=0.1, mask_rec_weight=1.0,
+                 kl_anneal_steps=1000, kl_free_bits=0.1, encoder_type="gnn",
+                 batch_adv_weight=0.0, num_batches=1, context_align_weight=0.0,
+                 mask_strategy="random", mask_gene_probs=None): # Added context_dim
+        print("\nInitializing Trainer...")
+        self.encoder_type = encoder_type
+        if encoder_type == "mlp":
+            self.encoder = MLPEncoder(in_dim, hid_dim, lat_dim, pe_dim=pe_dim).to(device)
+            self.dual_graph = False
+        else:
+            self.encoder = SpectralEncoder(in_dim, hid_dim, lat_dim, pe_dim=pe_dim, dual_graph=dual_graph).to(device)
+            self.dual_graph = dual_graph
+        # pass hid_dim for ScoreNet's internal MLP, can be different from GNN hid_dim
+        self.denoiser = ScoreNet(lat_dim, num_cell_types=num_cell_types, time_embed_dim=32, hid_dim_mlp=hid_dim, context_dim=context_dim).to(device) # pass context_dim
+        self.decoder = GeneDecoder(lat_dim, hid_dim, in_dim, zinb=True, use_libsize=True).to(device) # ZINB + libsize
+        self.diff = ScoreSDE(self.denoiser, T=max_time, N=timesteps).to(device) # use max_time
+        self.lap_pert = LaplacianPerturb()
+        self.batch_adv_weight = batch_adv_weight
+        self.context_align_weight = context_align_weight
+        self.mask_strategy = mask_strategy
+        self.mask_gene_probs = mask_gene_probs
+        self.batch_discriminator = None
+        self.ctx_proj = None
+        if num_batches > 1 and batch_adv_weight > 0.0:
+            self.batch_discriminator = BatchDiscriminator(lat_dim, num_batches).to(device)
+        if context_dim > 0 and context_align_weight > 0.0:
+            self.ctx_proj = nn.Linear(context_dim, lat_dim).to(device)
+        self.all_params = list(self.encoder.parameters()) + list(self.denoiser.parameters()) + list(self.decoder.parameters())
+        if self.batch_discriminator is not None:
+            self.all_params += list(self.batch_discriminator.parameters())
+        if self.ctx_proj is not None:
+            self.all_params += list(self.ctx_proj.parameters())
+        self.optim = torch.optim.Adam(self.all_params, lr=lr)
+        self.scaler = torch.amp.GradScaler('cuda', enabled=torch.cuda.is_available())
+        self.current_step = 0
+        self.input_masking_fraction = input_masking_fraction 
+        self.context_dim = context_dim
+        self.spectral_loss_weight = spectral_loss_weight
+        self.mask_rec_weight = mask_rec_weight
+        self.kl_anneal_steps = max(1, int(kl_anneal_steps))
+        self.kl_free_bits = kl_free_bits
+
+        if loss_weights is None: self.loss_weights = {'diff': 1.0, 'kl': 0.01, 'rec': 1.0} 
         else: self.loss_weights = loss_weights
         print(f"Using loss weights: {self.loss_weights}")
         print(f"Input masking fraction: {self.input_masking_fraction}")
+        print(f"Multimodal Context Dim: {self.context_dim}")
+        print(f"Encoder type: {self.encoder_type}")
+        print(f"Dual graph: {self.dual_graph}, Spectral loss weight: {self.spectral_loss_weight}, Mask-rec weight: {self.mask_rec_weight}")
+        print(f"KL anneal steps: {self.kl_anneal_steps}, KL free bits: {self.kl_free_bits}")
+        print(f"Batch adv weight: {self.batch_adv_weight}, Context align weight: {self.context_align_weight}")
+        print(f"Mask strategy: {self.mask_strategy}")
 
         num_warmup_steps_captured = warmup_steps
         num_training_steps_captured = total_steps
@@ -77,9 +176,12 @@ class Trainer:
     def train_epoch(self, loader, current_epoch_num): # Added current_epoch_num for logging
         self.encoder.train(); self.denoiser.train(); self.decoder.train()
         total_loss_val, total_loss_diff_val, total_loss_kl_val, total_loss_rec_val = 0.0, 0.0, 0.0, 0.0
+        total_loss_mask_val, total_loss_spec_val = 0.0, 0.0
         num_batches_processed = 0
 
-        for data in loader:
+        # TQDM Wrapper
+        pbar = tqdm(loader, desc=f"Epoch {current_epoch_num}", leave=False)
+        for data in pbar:
             data = data.to(device)
             num_nodes_in_batch = data.x.size(0)
             if num_nodes_in_batch == 0 or data.x is None or data.x.numel() == 0: continue
@@ -87,120 +189,197 @@ class Trainer:
             # --- Input Gene Masking ---
             original_x = data.x # Keep original for reconstruction target
             masked_x = data.x.clone()
+            mask = torch.zeros_like(masked_x, dtype=torch.bool)
             if self.encoder.training and self.input_masking_fraction > 0.0 and self.input_masking_fraction < 1.0:
-                # Create a mask for each cell independently
-                mask = torch.rand_like(masked_x) < self.input_masking_fraction
+                if self.mask_strategy == "high_var" and self.mask_gene_probs is not None:
+                    gene_probs = self.mask_gene_probs.to(masked_x.device)
+                    mask = torch.rand_like(masked_x) < gene_probs
+                else:
+                    # Create a mask for each cell independently
+                    mask = torch.rand_like(masked_x) < self.input_masking_fraction
                 masked_x[mask] = 0.0 # Set masked genes to zero
-                print(f"[DEBUG] Applied input masking. Fraction: {self.input_masking_fraction}, {(mask.sum() / masked_x.numel()):.3f} actual masked elements.")
 
             lap_pe = data.lap_pe
             if lap_pe is None or lap_pe.size(0) != num_nodes_in_batch or lap_pe.size(1) != self.encoder.pe_dim:
                 lap_pe = torch.zeros(num_nodes_in_batch, self.encoder.pe_dim, device=device, dtype=masked_x.dtype) # Use masked_x.dtype
 
             cell_type_labels = data.cell_type
-            if cell_type_labels is None or cell_type_labels.size(0) != num_nodes_in_batch:
-                cell_type_labels = torch.zeros(num_nodes_in_batch, dtype=torch.long, device=device)
-            if cell_type_labels.max() >= self.denoiser.num_cell_types or cell_type_labels.min() < 0:
-                cell_type_labels = torch.clamp(cell_type_labels, 0, self.denoiser.num_cell_types - 1)
+            if cell_type_labels is None: cell_type_labels = torch.zeros(num_nodes_in_batch, dtype=torch.long, device=device)
+            cell_type_labels = torch.clamp(cell_type_labels, 0, self.denoiser.num_cell_types - 1)
 
-            edge_weights = torch.ones(data.edge_index.size(1), device=device, dtype=masked_x.dtype) if data.edge_index.numel() > 0 else None
-            if edge_weights is not None and edge_weights.numel() > 0:
-                initial_perturbed_weights = self.lap_pert.sample(data.edge_index, num_nodes_in_batch)
-                adversarially_perturbed_weights = self.lap_pert.adversarial(self.encoder, masked_x, data.edge_index, initial_perturbed_weights) # Use masked_x for adversarial
-                adversarially_perturbed_weights = torch.nan_to_num(adversarially_perturbed_weights, nan=1.0, posinf=1.0, neginf=0.0)
-                adversarially_perturbed_weights = torch.clamp(adversarially_perturbed_weights, min=1e-4)
-            else: adversarially_perturbed_weights = None
+            edge_weights = None
+            adversarially_perturbed_weights = None
+            if self.encoder_type != "mlp":
+                edge_weights = torch.ones(data.edge_index.size(1), device=device) if data.edge_index.numel() > 0 else None
+                if edge_weights is not None:
+                    initial_perturbed_weights = self.lap_pert.sample(data.edge_index, num_nodes_in_batch)
+                    adversarially_perturbed_weights = self.lap_pert.adversarial(self.encoder, masked_x, data.edge_index, initial_perturbed_weights) # Use masked_x for adversarial
+                    adversarially_perturbed_weights = torch.clamp(torch.nan_to_num(adversarially_perturbed_weights, nan=1.0), min=1e-4)
 
+            # Physical graph (spatial coordinates)
+            edge_index_phys = getattr(data, 'edge_index_phys', None)
+            phys_weights = None
+            if self.encoder_type != "mlp" and edge_index_phys is not None and edge_index_phys.numel() > 0:
+                phys_weights = self.lap_pert.sample(edge_index_phys, num_nodes_in_batch)
+                phys_weights = self.lap_pert.adversarial(self.encoder, masked_x, edge_index_phys, phys_weights)
+                phys_weights = torch.clamp(torch.nan_to_num(phys_weights, nan=1.0), min=1e-4)
+            
             self.optim.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+            with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
                 # Encoder gets masked_x
-                mu, logvar = self.encoder(masked_x, data.edge_index, lap_pe, adversarially_perturbed_weights)
+                mu, logvar = self.encoder(masked_x, data.edge_index, lap_pe, adversarially_perturbed_weights,
+                                          edge_index_phys=edge_index_phys, edge_weight_phys=phys_weights)
                 if mu.numel() == 0 or logvar.numel() == 0: continue
                 if mu.size(0) != num_nodes_in_batch or logvar.size(0) != num_nodes_in_batch: continue
 
-                # --- KL Divergence ---
-                # Check for NaN/Inf in mu and logvar before KL calculation
-                if torch.isnan(mu).any() or torch.isinf(mu).any() or \
-                torch.isnan(logvar).any() or torch.isinf(logvar).any():
-                    print(f"Warning: NaN/Inf detected in encoder outputs (mu/logvar) at epoch {current_epoch_num}, step {self.current_step}. Skipping KL for this batch.")
-                    kl_div = torch.tensor(0.0, device=device) # Or a high penalty, or skip batch
-                else:
-                    # Correct KL formula: 0.5 * sum(mu^2 + exp(logvar) - 1 - logvar)
-                    # This should always be non-negative.
-                    kl_div_terms = 0.5 * (mu.pow(2) + logvar.exp() - 1.0 - logvar)
-                    # Ensure terms are non-negative (they should be theoretically)
-                    kl_div_terms_clamped = torch.relu(kl_div_terms) # Clamp at zero if any small negatives occur due to precision
-                    if (kl_div_terms < -1e-5).any(): # Check if any term was significantly negative before clamping
-                        print(f"Warning: Negative KL term detected before clamping at epoch {current_epoch_num}, step {self.current_step}. Min term: {kl_div_terms.min().item()}")
+                # --- Stability Check ---
+                if torch.isnan(mu).any() or torch.isnan(logvar).any():
+                    print(f"Warning: NaN/Inf detected in encoder outputs (mu/logvar). Skipping batch.")
+                    continue
+                
+                # Clamp logvar to prevent exploding std
+                logvar = torch.clamp(logvar, max=10)
 
-                    kl_div = torch.sum(kl_div_terms_clamped, dim=-1).mean() # Sum over lat_dim, then mean over batch
+                # --- KL Divergence ---
+                kl_div_terms = 0.5 * (mu.pow(2) + logvar.exp() - 1.0 - logvar)
+                if self.kl_free_bits is not None and self.kl_free_bits > 0:
+                    kl_div_terms = torch.clamp(kl_div_terms, min=self.kl_free_bits)
+                # use per-dimension mean KL to avoid scale blow-up with large latent dims
+                kl_div = torch.mean(torch.relu(kl_div_terms), dim=-1).mean()
+                if torch.isnan(kl_div): kl_div = torch.tensor(0.0, device=device)
 
                 std = torch.exp(0.5 * logvar)
+                eps = torch.randn_like(std)
+                z = mu + std * eps
                 t_indices = torch.randint(0, self.diff.N, (num_nodes_in_batch,), device=device).long()
                 time_values_for_loss = self.diff.timesteps[t_indices]
                 sigma_t_batch = self.diff.marginal_std(time_values_for_loss)
                 if sigma_t_batch.ndim == 1: sigma_t_batch = sigma_t_batch.unsqueeze(-1)
+                
                 noise_target = torch.randn_like(mu)
                 alpha_t = torch.exp(-time_values_for_loss).unsqueeze(-1)
                 zt_corrupted = alpha_t * mu.detach() + sigma_t_batch * noise_target
-                eps_predicted = self.denoiser(zt_corrupted, time_values_for_loss, cell_type_labels)
+                
+                # Multimodal Conditioning
+                context_embedding = None
+                if hasattr(data, 'chromatin') and data.chromatin is not None and data.chromatin.size(1) > 0:
+                     if data.chromatin.size(1) == self.denoiser.context_dim:
+                         context_embedding = data.chromatin
+                
+                eps_predicted = self.denoiser(zt_corrupted, time_values_for_loss, cell_type_labels, context_embedding=context_embedding)
                 loss_diff = F.mse_loss(eps_predicted, noise_target)
+                if torch.isnan(loss_diff): loss_diff = torch.tensor(0.0, device=device)
 
-                # --- Negative Binomial Reconstruction Loss (use original_x as target) ---
-                log_mu_rec, log_theta_rec = self.decoder(mu) # Decoder now returns two outputs
+                # --- Negative Binomial Reconstruction Loss ---
+                log_mu_rec, log_theta_rec, logit_pi_rec, log_libsize_pred = self.decoder(z)
                 
-                # Ensure mu and theta are positive and stable
-                mu_rec = torch.exp(log_mu_rec)
-                theta_rec = torch.exp(log_theta_rec)
+                mu_rec = torch.exp(torch.clamp(log_mu_rec, max=10)) # Avoid overflow
+                theta_rec = torch.exp(torch.clamp(log_theta_rec, min=-10, max=10))
+                theta_rec = torch.clamp(theta_rec, min=1e-4, max=1e4) # Strict clamping
                 
-                # Clamp theta to avoid numerical issues (e.g., very small or very large values)
-                theta_rec = torch.clamp(theta_rec, min=1e-6, max=1e6) # Added clamping for theta
+                target_counts = original_x.long()
 
-                target_counts = original_x.long() # Changed from .float() to .long()
-                
-                if mu_rec.shape != target_counts.shape or theta_rec.shape != target_counts.shape:
-                    print(f"Warning: Decoder output shape mismatch for NB loss. Skipping reconstruction loss.")
-                    loss_rec = torch.tensor(0.0, device=device)
-                elif torch.isnan(mu_rec).any() or torch.isinf(mu_rec).any() or \
-                    torch.isnan(theta_rec).any() or torch.isinf(theta_rec).any():
-                    print("Warning: Decoder output (mu/theta) contains NaN/Inf for NB loss. Skipping reconstruction loss.")
-                    loss_rec = torch.tensor(0.0, device=device)
+                # library size scaling for mu
+                libsize_true = target_counts.sum(dim=1, keepdim=True).float().clamp(min=1.0)
+                mu_sum = mu_rec.sum(dim=1, keepdim=True).clamp(min=1.0)
+                scale = (libsize_true / mu_sum).detach()
+                mu_rec = mu_rec * scale
+
+                # ZINB loss
+                probs_rec = mu_rec / (mu_rec + theta_rec + 1e-6)
+                probs_rec = torch.clamp(probs_rec, min=1e-4, max=1.0 - 1e-4)
+                nb_dist = dist.NegativeBinomial(total_count=theta_rec, probs=probs_rec)
+                log_nb = nb_dist.log_prob(target_counts)
+                if logit_pi_rec is None:
+                    loss_rec = -log_nb.mean()
                 else:
-                    # Negative Binomial distribution parameterized by total_count (dispersion) and probs
-                    # total_count is often denoted as 'r' or 'k'
-                    # probs = mean / (mean + total_count)
-                    probs_rec = mu_rec / (mu_rec + theta_rec)
-                    probs_rec = torch.clamp(probs_rec, min=1e-6, max=1 - 1e-6)  # Clamp to (0, 1)
-                    nb_dist = dist.NegativeBinomial(total_count=theta_rec, probs=probs_rec)
-                    loss_rec = -nb_dist.log_prob(target_counts).mean() # Negative log-likelihood
+                    pi = torch.sigmoid(logit_pi_rec)
+                    zero_mask = (target_counts == 0).float()
+                    log_zero = torch.log(pi + (1.0 - pi) * torch.exp(log_nb) + 1e-8)
+                    log_nonzero = torch.log(1.0 - pi + 1e-8) + log_nb
+                    log_prob = zero_mask * log_zero + (1.0 - zero_mask) * log_nonzero
+                    loss_rec = -log_prob.mean()
+                if torch.isnan(loss_rec): loss_rec = torch.tensor(0.0, device=device)
 
-                final_loss = (self.loss_weights.get('diff', 1.0) * loss_diff +
-                            self.loss_weights.get('kl', 0.1) * kl_div + # Optional KL annealing here
-                            self.loss_weights.get('rec', 1.0) * loss_rec)
+                # library size head loss
+                if log_libsize_pred is not None:
+                    libsize_target = torch.log(libsize_true)
+                    loss_libsize = F.mse_loss(log_libsize_pred, libsize_target)
+                else:
+                    loss_libsize = torch.tensor(0.0, device=device)
 
-            if torch.isnan(final_loss) or torch.isinf(final_loss):
-                print(f"Warning: NaN/Inf loss detected at epoch {current_epoch_num}, step {self.current_step}. Skipping batch.")
-                continue
+                # masked reconstruction
+                if mask.any():
+                    masked_target = target_counts[mask]
+                    masked_mu = mu_rec[mask]
+                    masked_theta = theta_rec[mask]
+                    probs_mask = torch.clamp(masked_mu / (masked_mu + masked_theta + 1e-6), 1e-6, 1-1e-6)
+                    nb_mask = dist.NegativeBinomial(total_count=masked_theta, probs=probs_mask)
+                    if logit_pi_rec is None:
+                        loss_mask = -nb_mask.log_prob(masked_target).mean()
+                    else:
+                        pi_mask = torch.sigmoid(logit_pi_rec[mask])
+                        log_nb_m = nb_mask.log_prob(masked_target)
+                        zero_mask_m = (masked_target == 0).float()
+                        log_zero_m = torch.log(pi_mask + (1.0 - pi_mask) * torch.exp(log_nb_m) + 1e-8)
+                        log_nonzero_m = torch.log(1.0 - pi_mask + 1e-8) + log_nb_m
+                        log_prob_m = zero_mask_m * log_zero_m + (1.0 - zero_mask_m) * log_nonzero_m
+                        loss_mask = -log_prob_m.mean()
+                else:
+                    loss_mask = torch.tensor(0.0, device=device)
 
+                # spectral alignment across feature vs spatial graphs
+                spectral_loss = torch.tensor(0.0, device=device)
+                if self.dual_graph and self.encoder_type != "mlp" and edge_index_phys is not None and edge_index_phys.numel() > 0 and mu.numel() > 0:
+                    from laplace.utils import laplacian_smooth
+                    mu_feat = laplacian_smooth(mu, data.edge_index, adversarially_perturbed_weights)
+                    mu_phys = laplacian_smooth(mu, edge_index_phys, phys_weights)
+                    spectral_loss = F.mse_loss(mu_feat, mu_phys)
+
+                # cross-modal alignment (context -> latent)
+                context_align_loss = torch.tensor(0.0, device=device)
+                if self.ctx_proj is not None and context_embedding is not None:
+                    context_lat = self.ctx_proj(context_embedding)
+                    context_align_loss = F.mse_loss(context_lat, mu)
+
+                # batch adversarial invariance (DRO-style)
+                batch_adv_loss = torch.tensor(0.0, device=device)
+                if self.batch_discriminator is not None and hasattr(data, 'batch_id') and data.batch_id is not None:
+                    batch_logits = self.batch_discriminator(grad_reverse(mu, lambda_=1.0))
+                    batch_adv_loss = F.cross_entropy(batch_logits, data.batch_id)
+
+                kl_weight = min(1.0, self.current_step / self.kl_anneal_steps) * self.loss_weights['kl']
+                final_loss = (self.loss_weights['diff'] * loss_diff + 
+                              kl_weight * kl_div + 
+                              self.loss_weights['rec'] * loss_rec +
+                              self.mask_rec_weight * loss_mask +
+                              self.spectral_loss_weight * spectral_loss +
+                              self.context_align_weight * context_align_loss +
+                              self.batch_adv_weight * batch_adv_loss +
+                              0.1 * loss_libsize)
+
+            if torch.isnan(final_loss):
+                 print(f"Warning: NaN loss detected at epoch {current_epoch_num}, step {self.current_step}. Skipping batch.")
+                 continue
+            
             self.scaler.scale(final_loss).backward()
             self.scaler.unscale_(self.optim)
-            torch.nn.utils.clip_grad_norm_(self.all_params, max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(self.all_params, 1.0)
             self.scaler.step(self.optim)
             self.scaler.update()
-            self.scheduler.step()
+            if getattr(self.optim, "_step_count", 0) > 0:
+                self.scheduler.step()
             self.current_step += 1
 
-            # Debug prints for loss values and learning rate
-            if self.current_step % 10 == 0 or num_batches_processed < 5 : 
-                lr_val = self.optim.param_groups[0]['lr']
-                print(f"Epoch {current_epoch_num} | Batch Step {self.current_step} (Overall) | Optim Steps (approx): {self.optim._step_count} | Scheduler Steps: {self.scheduler._step_count} | LR: {lr_val:.3e}")
-                print(f"    Losses -> Total: {final_loss.item():.4f}, Diff: {loss_diff.item():.4f}, KL: {kl_div.item():.4f}, Rec: {loss_rec.item():.4f}")
-
+            if self.current_step % 10 == 0:
+                 pbar.set_postfix({'Total': final_loss.item(), 'Diff': loss_diff.item(), 'KL': kl_div.item(), 'Rec': loss_rec.item()})
 
             total_loss_val += final_loss.item()
             total_loss_diff_val += loss_diff.item()
             total_loss_kl_val += kl_div.item()
             total_loss_rec_val += loss_rec.item()
+            total_loss_mask_val += loss_mask.item()
+            total_loss_spec_val += spectral_loss.item()
             num_batches_processed +=1
 
         if num_batches_processed > 0:
@@ -208,10 +387,12 @@ class Trainer:
             avg_diff_loss = total_loss_diff_val / num_batches_processed
             avg_kl_loss = total_loss_kl_val / num_batches_processed
             avg_rec_loss = total_loss_rec_val / num_batches_processed
-            return avg_total_loss, avg_diff_loss, avg_kl_loss, avg_rec_loss # Return all for detailed logging
+            avg_mask_loss = total_loss_mask_val / num_batches_processed
+            avg_spec_loss = total_loss_spec_val / num_batches_processed
+            return avg_total_loss, avg_diff_loss, avg_kl_loss, avg_rec_loss, avg_mask_loss, avg_spec_loss # Return all for detailed logging
         else:
             print(f"Warning: No batches processed in epoch {current_epoch_num}.")
-            return 0.0, 0.0, 0.0, 0.0
+            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
     def state_dict(self):
         return {
@@ -225,10 +406,11 @@ class Trainer:
         }
     
     @torch.no_grad()
-    def generate(self, num_samples, cell_type_condition=None):
+    def generate(self, num_samples, cell_type_condition=None, context_embedding=None):
         print(f"\nGenerating {num_samples} samples...")
         self.denoiser.eval(); self.decoder.eval()
-        if cell_type_condition is None:
+
+        if cell_type_condition is None or self.denoiser.num_cell_types <= 1:
             print("Generating unconditionally.")
             gen_cell_type_labels_tensor = torch.zeros(num_samples, dtype=torch.long, device=device)
         else:
@@ -237,16 +419,16 @@ class Trainer:
             else: raise ValueError("cell_type_condition type error.")
             if gen_cell_type_labels_tensor.size(0) == 1 and num_samples > 1: gen_cell_type_labels_tensor = gen_cell_type_labels_tensor.repeat(num_samples)
             elif gen_cell_type_labels_tensor.size(0) != num_samples: raise ValueError(f"Cell type condition size mismatch.")
-            if gen_cell_type_labels_tensor.max() >= self.denoiser.num_cell_types or gen_cell_type_labels_tensor.min() < 0:
+            if self.denoiser.num_cell_types > 1 and (gen_cell_type_labels_tensor.max() >= self.denoiser.num_cell_types or gen_cell_type_labels_tensor.min() < 0):
                 print(f"Warning: Generated cell type label out of bounds. Clamping.")
                 gen_cell_type_labels_tensor = torch.clamp(gen_cell_type_labels_tensor, 0, self.denoiser.num_cell_types - 1)
 
         z_gen_shape = (num_samples, self.diff.score_model.lat_dim)
-        # NOTE: sample_guided internally uses torch.enable_grad() if needed for guidance
-        z_generated = self.diff.sample(z_gen_shape, cell_type_labels=gen_cell_type_labels_tensor)
+        # sample_guided internally uses torch.enable_grad() if needed for guidance
+        z_generated = self.diff.sample(z_gen_shape, cell_type_labels=gen_cell_type_labels_tensor, context_embedding=context_embedding)
         
         # decoder now returns log_mu and log_theta
-        log_mu_gen, log_theta_gen = self.decoder(z_generated)
+        log_mu_gen, log_theta_gen, logit_pi_gen, log_libsize_pred = self.decoder(z_generated)
         
         # convert to mu and theta
         mu_gen = torch.exp(log_mu_gen)
@@ -255,11 +437,26 @@ class Trainer:
         # clamp theta for stability during sampling
         theta_gen = torch.clamp(theta_gen, min=1e-6, max=1e6)
 
+        # optional library size scaling (use predicted head if available)
+        if log_libsize_pred is not None:
+            libsize_target = torch.exp(log_libsize_pred).clamp(min=1.0)
+            mu_sum = mu_gen.sum(dim=1, keepdim=True).clamp(min=1.0)
+            mu_gen = mu_gen * (libsize_target / mu_sum)
+
         try:
-            # sample from Negative Binomial
-            nb_dist = dist.NegativeBinomial(total_count=theta_gen, probs=mu_gen / (mu_gen + theta_gen))
-            generated_counts_tensor = nb_dist.sample().int().float()
-            generated_counts_tensor = torch.nan_to_num(generated_counts_tensor, nan=0.0, posinf=0.0, neginf=0.0) # handle potential NaNs from sampling
+            # sample from ZINB if available
+            probs = mu_gen / (mu_gen + theta_gen + 1e-6)
+            probs = torch.clamp(probs, min=1e-6, max=1-1e-6)
+            nb_dist = dist.NegativeBinomial(total_count=theta_gen, probs=probs)
+            if logit_pi_gen is None:
+                generated_counts_tensor = nb_dist.sample().to(torch.int32).float()
+            else:
+                pi = torch.sigmoid(logit_pi_gen)
+                nb_sample = nb_dist.sample()
+                zero_mask = (torch.rand_like(pi) < pi)
+                nb_sample = nb_sample.masked_fill(zero_mask, 0)
+                generated_counts_tensor = nb_sample.to(torch.int32).float()
+            generated_counts_tensor = torch.nan_to_num(generated_counts_tensor, nan=0.0, posinf=0.0, neginf=0.0)
         except Exception as e:
             print(f"Error during sampling from Negative Binomial: {e}. Returning zero counts."); traceback.print_exc()
             generated_counts_tensor = torch.zeros_like(mu_gen) # use mu_gen shape for consistency
@@ -321,70 +518,70 @@ class Trainer:
             pca = PCA(n_components=actual_n_pcs, random_state=0)
             real_pca = pca.fit_transform(real_log1p)
             generated_pca = pca.transform(generated_log1p)
+            real_pca_np = pca.fit_transform(real_log1p)
+            generated_pca_np = pca.transform(generated_log1p)
         except Exception as e: print(f"Error during PCA: {e}."); return {"MMD": {}, "Wasserstein": {}, "Notes": f"PCA failed: {e}"}
-        if real_pca.shape[0] == 0 or generated_pca.shape[0] == 0: print("Error: PCA projected data empty."); return {"MMD": {}, "Wasserstein": {}, "Notes": "PCA projected data empty."}
+        if real_pca_np.shape[0] == 0 or generated_pca_np.shape[0] == 0: print("Error: PCA projected data empty."); return {"MMD": {}, "Wasserstein": {}, "Notes": "PCA projected data empty."}
+        real_pca = torch.tensor(real_pca_np, dtype=torch.float32, device=device)
+        gen_pca = torch.tensor(generated_pca_np, dtype=torch.float32, device=device)
+        real_cell_types_tensor = torch.tensor(real_cell_type_labels, dtype=torch.long, device=device) if real_cell_type_labels is not None else None
+        gen_cell_types_tensor = torch.tensor(generated_cell_types_np, dtype=torch.long, device=device) if generated_cell_types_np is not None else None
 
         mmd_results, wasserstein_results = {}, {}
-        def rbf_kernel_mmd(X, Y, scales_list):
-            if X.shape[0] == 0 or Y.shape[0] == 0: return {scale: 0.0 for scale in scales_list}
-            mmd_vals = {}
-            try:
-                dist_xx = cdist(X, X, 'sqeuclidean')
-                dist_yy = cdist(Y, Y, 'sqeuclidean')
-                dist_xy = cdist(X, Y, 'sqeuclidean')
-                for scale in scales_list:
-                    gamma = 1.0 / (2. * scale**2 + 1e-9) # add epsilon for scale=0 case
-                    K_xx, K_yy, K_xy = np.exp(-gamma * dist_xx), np.exp(-gamma * dist_yy), np.exp(-gamma * dist_xy)
-                    mmd2 = K_xx.mean() + K_yy.mean() - 2 * K_xy.mean()
-                    mmd_vals[scale] = max(0, mmd2)
-            except Exception as e_mmd: print(f"Error in MMD calc: {e_mmd}"); return {s: np.nan for s in scales_list}
-            return mmd_vals
-
-        if real_cell_types_present:
-            unique_real_types = np.unique(real_cell_type_labels)
-            unique_gen_types = np.unique(generated_cell_types_np)
-            common_types = np.intersect1d(unique_real_types, unique_gen_types)
-            if len(common_types) > 0:
-                print(f"Computing conditional metrics for {len(common_types)} common cell types.")
-                cond_mmd_agg = {scale: [] for scale in mmd_scales}
-                cond_w_agg = []
-                for ct_code in common_types:
-                    ct_name = real_cell_type_categories[ct_code] if ct_code < len(real_cell_type_categories) else f"Code_{ct_code}"
-                    real_pca_type = real_pca[real_cell_type_labels == ct_code]
-                    gen_pca_type = generated_pca[generated_cell_types_np == ct_code]
-                    if real_pca_type.shape[0] < 2 or gen_pca_type.shape[0] < 2: continue
-                    
-                    mmd_type_s = rbf_kernel_mmd(real_pca_type, gen_pca_type, mmd_scales)
-                    for s, val in mmd_type_s.items(): cond_mmd_agg[s].append(val)
-                    try:
-                        M = cdist(real_pca_type, gen_pca_type, 'sqeuclidean')
-                        a = np.ones(real_pca_type.shape[0]) / real_pca_type.shape[0]
-                        b = np.ones(gen_pca_type.shape[0]) / gen_pca_type.shape[0]
-                        w2_type = ot.emd2(a, b, M)
-                        cond_w_agg.append(np.sqrt(max(0, w2_type))) # ensure non-negative before sqrt
-                    except Exception as e_w: print(f"Error W-dist for type {ct_name}: {e_w}"); cond_w_agg.append(np.nan)
-                
-                for s in mmd_scales: mmd_results[f'Conditional_Avg_Scale_{s}'] = np.nanmean(cond_mmd_agg[s]) if cond_mmd_agg[s] else np.nan
-                wasserstein_results['Conditional_Avg'] = np.nanmean(cond_w_agg) if cond_w_agg else np.nan
-            else: print("No common cell types for conditional metrics.")
-        else: print("Skipping conditional metrics: Real data missing cell types.")
-
         print("Computing unconditional metrics.")
         sample_size_uncond = 5000
         real_pca_s = real_pca[np.random.choice(real_pca.shape[0], min(sample_size_uncond, real_pca.shape[0]), replace=False)] if real_pca.shape[0] > 1 else real_pca
-        gen_pca_s = generated_pca[np.random.choice(generated_pca.shape[0], min(sample_size_uncond, generated_pca.shape[0]), replace=False)] if generated_pca.shape[0] > 1 else generated_pca
+        gen_pca_s = gen_pca[np.random.choice(gen_pca.shape[0], min(sample_size_uncond, gen_pca.shape[0]), replace=False)] if gen_pca.shape[0] > 1 else gen_pca
 
         if real_pca_s.shape[0] >= 2 and gen_pca_s.shape[0] >= 2:
-            mmd_uncond_s = rbf_kernel_mmd(real_pca_s, gen_pca_s, mmd_scales)
+            mmd_uncond_s = rbf_mmd_gpu(real_pca_s, gen_pca_s, mmd_scales) 
             for s, val in mmd_uncond_s.items(): mmd_results[f'Unconditional_Scale_{s}'] = val
             try:
-                M_uncond = cdist(real_pca_s, gen_pca_s, 'sqeuclidean')
-                a_u = np.ones(real_pca_s.shape[0]) / real_pca_s.shape[0]
-                b_u = np.ones(gen_pca_s.shape[0]) / gen_pca_s.shape[0]
-                w2_uncond = ot.emd2(a_u, b_u, M_uncond)
-                wasserstein_results['Unconditional'] = np.sqrt(max(0, w2_uncond)) # Ensure non-negative
+                w2_uncond = sliced_wasserstein_gpu(real_pca_s, gen_pca_s)
+                wasserstein_results['Unconditional'] = w2_uncond
             except Exception as e_w_u: print(f"Error W-dist uncond: {e_w_u}"); wasserstein_results['Unconditional'] = np.nan
         else: print("Not enough samples for unconditional metrics after sampling.")
+
+        # Conditional Metrics
+        if real_cell_types_tensor is not None and gen_cell_types_tensor is not None:
+             print("Computing conditional metrics...")
+             real_labels = real_cell_types_tensor.to(device).long()
+             gen_labels = gen_cell_types_tensor.to(device).long()
+             
+             unique_real = torch.unique(real_labels)
+             unique_gen = torch.unique(gen_labels)
+             
+             cond_mmd = {s: [] for s in mmd_scales}
+             cond_w = []
+             
+             for ct in unique_real:
+                  if ct in unique_gen:
+                       real_sub = real_pca[real_labels == ct]
+                       gen_sub = gen_pca[gen_labels == ct]
+                       # sample 
+                       min_len = min(real_sub.size(0), gen_sub.size(0))
+                       target_size = min(min_len, 5000)
+                       
+                       if target_size < 5: 
+                           continue
+                       
+                       idx_r = torch.randperm(real_sub.size(0))[:target_size]
+                       real_sub = real_sub[idx_r]
+                       idx_g = torch.randperm(gen_sub.size(0))[:target_size]
+                       gen_sub = gen_sub[idx_g]
+                       mmd_res = rbf_mmd_gpu(real_sub, gen_sub, mmd_scales)
+
+                       for s, v in mmd_res.items(): cond_mmd[s].append(v)
+                       # SWD
+                       swd_sub = sliced_wasserstein_gpu(real_sub, gen_sub)
+                       cond_w.append(swd_sub)
+                       
+             for s in mmd_scales:
+                  if cond_mmd[s]: mmd_results[f"Conditional_Avg_Scale_{s}"] = np.mean(cond_mmd[s])
+                  else: mmd_results[f"Conditional_Avg_Scale_{s}"] = float('nan')
+                  
+             if cond_w: wasserstein_results["Conditional_Avg"] = np.mean(cond_w)
+             else: wasserstein_results["Conditional_Avg"] = float('nan')
 
         print("Evaluation metrics computation complete.")
         return {"MMD": mmd_results, "Wasserstein": wasserstein_results}
@@ -394,15 +591,17 @@ class Trainer:
         try:
             from sklearn.ensemble import RandomForestClassifier
             from sklearn.metrics import accuracy_score, f1_score
-            from sklearn.preprocessing import StandardScaler
             
-            # Prepare Synthetic Data
             if generated_cell_types is None:
                  print("TSTR skipped: No generated cell types."); return {}
             
+            num_classes = len(np.unique(real_adata.obs['cell_type'])) if 'cell_type' in real_adata.obs else 1
+            if generated_cell_types.min() < 0 or generated_cell_types.max() >= num_classes:
+                print(f"Warning: Generated cell type labels out of bounds [{generated_cell_types.min()}, {generated_cell_types.max()}]. Clamping to [0, {num_classes-1}].")
+                generated_cell_types = np.clip(generated_cell_types, 0, num_classes - 1)
+            
             # Use PCA features for speed and robustness
             def process_for_ml(counts_np):
-                 # Log1p
                  sums = counts_np.sum(axis=1, keepdims=True)
                  sums[sums==0] = 1
                  norm = counts_np / sums * 1e4
@@ -411,8 +610,6 @@ class Trainer:
             X_syn = process_for_ml(generated_counts)
             y_syn = generated_cell_types.astype(int)
             
-            # Prepare Real Data
-            # Note: real_adata.obs should have 'cell_type' now if fallback worked
             if not hasattr(real_adata, 'X') or 'cell_type' not in real_adata.obs.columns:
                  print("TSTR skipped: Real data missing X or cell_type."); return {}
             
@@ -436,6 +633,306 @@ class Trainer:
             print(f"Error computing TSTR: {e}")
             return {}
 
+    def evaluate_grn_recovery(self, real_adata, generated_counts):
+        """
+        Evaluates Gene Regulatory Network (GRN) Recovery.
+        Compares gene-gene correlation matrices of Real vs Synthetic.
+        """
+        print("\n--- Computing GRN Recovery (Correlation Matrix Similarity) ---")
+        try:
+            X_syn = generated_counts
+            if isinstance(X_syn, torch.Tensor): X_syn = X_syn.cpu().numpy()
+            if sp.issparse(X_syn): X_syn = X_syn.toarray()
+            
+            X_real = real_adata.X
+            if sp.issparse(X_real): X_real = X_real.toarray()
+            n_genes = X_syn.shape[1]
+
+            if n_genes > 2000:
+                # fast HVG logic
+                mean = X_real.mean(axis=0)
+                var = X_real.var(axis=0)
+                dispersion = var / (mean + 1e-9)
+                hvg_indices = np.argsort(dispersion)[-2000:]
+                X_syn = X_syn[:, hvg_indices]
+                X_real = X_real[:, hvg_indices]
+
+            std_syn = X_syn.std(axis=0)
+            std_real = X_real.std(axis=0)
+            keep = (std_syn > 0) & (std_real > 0)
+            if np.sum(keep) < 2:
+                print("Warning: Not enough variable genes for GRN correlation.")
+                return {"GRN_Diff_Norm": float("nan"), "GRN_Spearman": float("nan")}
+            X_syn = X_syn[:, keep]
+            X_real = X_real[:, keep]
+            corr_syn = np.corrcoef(X_syn, rowvar=False)
+            corr_real = np.corrcoef(X_real, rowvar=False)
+            
+            corr_syn = np.nan_to_num(corr_syn)
+            corr_real = np.nan_to_num(corr_real)
+            diff_norm = np.linalg.norm(corr_real - corr_syn) / np.linalg.norm(corr_real)
+            iu = np.triu_indices(corr_syn.shape[0], k=1)
+            spearman_corr = 0
+            if len(iu[0]) > 0:
+                from scipy.stats import spearmanr
+                flat_syn = corr_syn[iu]
+                flat_real = corr_real[iu]
+                if len(flat_syn) > 100000:
+                     idx = np.random.choice(len(flat_syn), 100000, replace=False)
+                     flat_syn = flat_syn[idx]
+                     flat_real = flat_real[idx]
+                
+                spearman_corr, _ = spearmanr(flat_real, flat_syn)
+            
+            print(f"GRN Recovery -> Matrix Norm Diff (Relative): {diff_norm:.4f}, Correlation of Correlations (Spearman): {spearman_corr:.4f}")
+            return {"GRN_Diff_Norm": diff_norm, "GRN_Spearman": spearman_corr}
+            
+        except Exception as e:
+            print(f"Error computing GRN: {e}"); traceback.print_exc()
+            return {}
+
+    @torch.no_grad()
+    def evaluate_infill(self, real_adata, mask_fraction=0.2, num_samples=50):
+        print(f"\n--- Computing Inpainting Evaluation Metrics (Mask Fraction: {mask_fraction}) ---")
+        try:
+             X_real = real_adata.X
+             if sp.issparse(X_real): X_real = X_real.toarray()
+             s = X_real.sum(axis=1, keepdims=True); s[s == 0] = 1.0
+             X_real = np.log1p(X_real / s * 1e4)
+             
+             indices = np.random.choice(X_real.shape[0], min(num_samples, X_real.shape[0]), replace=False)
+             X_batch = torch.tensor(X_real[indices], device=device).float()
+             
+             mask = torch.rand_like(X_batch) < mask_fraction
+             X_masked = X_batch.clone()
+             X_masked[mask] = 0.0 
+             
+             print(f"Performing Diffusion-Based Inpainting for {num_samples} samples...")
+             self.denoiser.eval(); self.decoder.eval()
+             
+             dummy_edge_index = torch.empty((2,0), dtype=torch.long, device=device)
+             dummy_pe = torch.zeros(X_batch.size(0), self.encoder.pe_dim, device=device)
+             
+             def inpainting_guidance(z0_hat, t):
+                 log_mu_rec, _, _, _ = self.decoder(z0_hat)
+                 mu_rec = torch.log1p(torch.exp(log_mu_rec))
+                 observed_mask = ~mask
+                 diff = (mu_rec - X_batch) * observed_mask.float()
+                 loss = (diff ** 2).sum()
+                 grad = torch.autograd.grad(loss, z0_hat)[0]
+                 return -grad # negative gradient of loss is direction to minimize loss
+             
+             z_shape = (num_samples, self.diff.score_model.lat_dim)
+             
+             # Use sample_guided
+             context_embedding = None 
+             if hasattr(real_adata, 'obsm') and 'chromatin' in real_adata.obsm:
+                 pass 
+                 
+             z_inpainted = self.diff.sample_guided(z_shape, guidance_fn=inpainting_guidance, guidance_scale=100.0)
+             
+             log_mu_final, _, _, _ = self.decoder(z_inpainted)
+             mu_rec = torch.log1p(torch.exp(log_mu_final))
+             imputed_vals = mu_rec[mask]
+             true_vals = X_batch[mask]
+             mse = F.mse_loss(imputed_vals, true_vals).item()
+
+             try:
+                 from scipy.stats import pearsonr
+                 corr, _ = pearsonr(imputed_vals.cpu().numpy(), true_vals.cpu().numpy())
+             except: corr = 0.0
+             
+             print(f"Inpainting MSE: {mse:.4f}, Correlation: {corr:.4f}")
+             return {"Inpainting_MSE": mse, "Inpainting_Corr": corr}
+             
+        except Exception as e:
+            print(f"Error computing inpainting: {e}"); traceback.print_exc()
+            return {}
+
+    def compute_spectral_mismatch(self, adata, k=10):
+        print("\n--- Computing Spectral Mismatch ---")
+        try:
+            if 'spatial' not in adata.obsm: return {}
+            
+            # physical graph laplacian
+            from sklearn.neighbors import kneighbors_graph
+            coords = adata.obsm['spatial']
+            A_phys = kneighbors_graph(coords, 15, mode='connectivity', include_self=False)
+            L_phys = sp.csgraph.laplacian(A_phys, normed=True)
+            vals_phys, vecs_phys = eigsh(L_phys, k=k, which='SM')
+            
+            # feature graph laplacian
+            X = adata.X
+            if sp.issparse(X): X = X.toarray()
+            # pca first if needed
+            if X.shape[1] > 50:
+                 pca = PCA(n_components=50)
+                 X = pca.fit_transform(X)
+            
+            from sklearn.neighbors import kneighbors_graph
+            A_feat = kneighbors_graph(X, 15, mode='connectivity', include_self=False)
+            L_feat = sp.csgraph.laplacian(A_feat, normed=True)
+            vals_feat, vecs_feat = eigsh(L_feat, k=k, which='SM')
+            
+            U, S, V = np.linalg.svd(vecs_phys.T @ vecs_feat)
+            spectral_overlap = np.mean(S)
+            spectral_mismatch = 1.0 - spectral_overlap
+            
+            print(f"Spectral Mismatch (1 - avg_cosine_principal_angles): {spectral_mismatch:.4f}")
+            return {"Spectral_Mismatch": spectral_mismatch}
+            
+        except Exception as e:
+            print(f"Error Spectral Mismatch: {e}"); return {}
+
+    @torch.no_grad()
+    def evaluate_interpolation(self, real_adata, num_steps=10):
+        """
+        Performs latent space interpolation between different cell types.
+        Simulates "differentiation trajectories" or transitions.
+        """
+        print(f"\n--- Computing Latent Interpolations (Geometric Surgery) ---")
+        try:
+            # get centroids of each cell type in real data
+            if not hasattr(real_adata, 'X') or 'cell_type' not in real_adata.obs.columns:
+                 print("Interpolation skipped: Missing data/labels."); return
+            
+            X_real = real_adata.X
+            if sp.issparse(X_real): X_real = X_real.toarray()
+            X_real = torch.tensor(X_real, device=device).float()
+            
+            labels = real_adata.obs['cell_type'].astype('category').cat.codes.values
+            unique_labels = np.unique(labels)
+            
+            if len(unique_labels) < 2:
+                 print("Interpolation skipped: < 2 cell types."); return
+
+            # encode real data to get latent Z
+            print("Sampling Z for each cell type (Conditional Generation)...")
+            z_centroids = {}
+            for label in unique_labels:
+
+                # Generate a batch of Z for this label
+                z_shape = (50, self.diff.score_model.lat_dim)
+                label_tensor = torch.full((50,), label, dtype=torch.long, device=device)
+                z_gen = self.diff.sample(z_shape, cell_type_labels=label_tensor) # This is the "Denoised Latent"
+                z_centroids[label] = z_gen.mean(dim=0)
+            
+            # interpolate between pairs
+            from itertools import combinations
+            pairs = list(combinations(unique_labels, 2))
+            if len(pairs) > 5: pairs = pairs[:5] # Limit to 5 pairs
+            
+            interpolated_trajectories = []
+            
+            for (l1, l2) in pairs:
+                z1 = z_centroids[l1]
+                z2 = z_centroids[l2]
+                
+                alphas = torch.linspace(0, 1, num_steps, device=device)
+                trajectory_z = []
+                for alpha in alphas:
+                    z_interp = (1 - alpha) * z1 + alpha * z2
+                    trajectory_z.append(z_interp)
+                
+                trajectory_z = torch.stack(trajectory_z) # (Steps, LatDim)
+                
+                # Decode Trajectory
+                log_mu, _, _, _ = self.decoder(trajectory_z)
+                mu = torch.exp(log_mu).cpu().numpy()
+                
+                interpolated_trajectories.append({
+                    'pair': (l1, l2),
+                    'trajectory': mu
+                })
+                
+            print(f"Computed interpolations for {len(interpolated_trajectories)} pairs.")
+            return interpolated_trajectories
+
+        except Exception as e: print(f"Error Interpolation: {e}"); traceback.print_exc()
+
+    def evaluate_marker_genes(self, real_adata, generated_counts, generated_cell_types, top_k=5):
+        """
+        Extracts marker genes for each cell type from Real Data and checks if they are 
+        upregulated in the corresponding Generated Cell Type.
+        """
+        print("\n--- Computing Marker Gene Conservation ---")
+        try:
+            if not hasattr(real_adata, 'X') or 'cell_type' not in real_adata.obs.columns:
+                 print("Marker Gene Eval skipped: Missing data/labels."); return {}
+
+            # identify markers in real data
+            print("Identifying Marker Genes in Real Data (Naive approach)...")
+            real_adata_raw = real_adata.copy()
+            if sp.issparse(real_adata_raw.X): real_adata_raw.X = real_adata_raw.X.toarray()
+            
+            sc.pp.normalize_total(real_adata_raw, target_sum=1e4)
+            sc.pp.log1p(real_adata_raw)
+            sc.tl.rank_genes_groups(real_adata_raw, 'cell_type', method='t-test', use_raw=False)
+            
+            gen_counts_np = generated_counts.cpu().numpy() if isinstance(generated_counts, torch.Tensor) else generated_counts
+            gen_types_np = generated_cell_types.cpu().numpy() if isinstance(generated_cell_types, torch.Tensor) else generated_cell_types
+            
+            gen_adata = sc.AnnData(X=gen_counts_np)
+            gen_adata.obs['cell_type'] = gen_types_np
+            sc.pp.normalize_total(gen_adata, target_sum=1e4)
+            sc.pp.log1p(gen_adata)
+            
+            sc.tl.rank_genes_groups(gen_adata, 'cell_type', method='t-test', use_raw=False)
+            
+            groups = real_adata_raw.obs['cell_type'].unique()
+            overlaps = []
+            for group in groups:
+                 try:
+                     real_markers = set(real_adata_raw.uns['rank_genes_groups']['names'][group][:50])
+                     if group in gen_adata.obs['cell_type'].unique():
+                         gen_markers = set(gen_adata.uns['rank_genes_groups']['names'][group][:50])
+                         overlap = len(real_markers.intersection(gen_markers)) / 50.0
+                         overlaps.append(overlap)
+                 except: pass
+            
+            avg_overlap = np.mean(overlaps) if len(overlaps) > 0 else 0.0
+            print(f"Marker Gene Overlap (Top 50): {avg_overlap:.4f}")
+            return {"Marker_Overlap": avg_overlap}
+            
+        except Exception as e: print(f"Error Marker Genes: {e}"); return {}
+
+    def compute_morans_i(self, adata, n_neighbors=30):
+        print("\n--- Computing Spatial Autocorrelation (Moran's I) ---")
+        try:
+            if 'spatial' not in adata.obsm:
+                 print("Moran's I skipped: No spatial coordinates."); return {}
+
+            # calculate for top variable genes
+            sc.pp.calculate_qc_metrics(adata, inplace=True)
+            top_genes = adata.var['total_counts'].sort_values(ascending=False).index[:50]
+            
+            # use sq Euclidean distance weights
+            from sklearn.neighbors import kneighbors_graph
+            spatial_connectivities = kneighbors_graph(adata.obsm['spatial'], n_neighbors, mode='connectivity', include_self=False)
+            
+            X = adata[:, top_genes].X
+            if sp.issparse(X): X = X.toarray()
+            
+            # formula: I = (N/W) * sum_ij w_ij (x_i - x_bar)(x_j - x_bar) / sum_i (x_i - x_bar)^2
+            N = X.shape[0]
+            W = spatial_connectivities.sum()
+            
+            morans_i_scores = []
+            for k in range(X.shape[1]):
+                x = X[:, k]
+                x_bar = x.mean()
+                num = (spatial_connectivities @ (x - x_bar)) @ (x - x_bar) # Optimized
+                den = ((x - x_bar)**2).sum()
+                if den == 0: val = 0
+                else: val = (N / W) * (num / den)
+                morans_i_scores.append(val)
+                
+            avg_moran = np.mean(morans_i_scores)
+            print(f"Average Moran's I (Top 50 Genes): {avg_moran:.4f}")
+            return {"Morans_I": avg_moran}
+            
+        except Exception as e: print(f"Error Moran's I: {e}"); return {}
+
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
@@ -449,15 +946,31 @@ if __name__ == '__main__':
     parser.add_argument('--loss_weight_diff', type=float, default=0.005)
     parser.add_argument('--loss_weight_kl', type=float, default=0.5)
     parser.add_argument('--loss_weight_rec', type=float, default=0.005)
-    parser.add_argument('--input_masking_fraction', type=float, default=0.1)
+    parser.add_argument('--input_masking_fraction', type=float, default=0.2)
     parser.add_argument('--knn', type=int, default=30)
     parser.add_argument('--pe_dim', type=int, default=50)
     parser.add_argument('--pca_dim', type=int, default=50)
     parser.add_argument('--gene_threshold', type=int, default=20)
     parser.add_argument('--timesteps_diffusion', type=int, default=1000)
+    parser.add_argument('--max_time', type=float, default=1.0) # diffusion max time
     parser.add_argument('--viz', type=bool, default=True)
-    parser.add_argument('--num_gnn_layers', type=int, default=3) # Unused in simple init but kept for args compatibility
+    parser.add_argument('--num_gnn_layers', type=int, default=3)
     parser.add_argument('--num_mlp_layers', type=int, default=3)
+    parser.add_argument('--spectral_loss_weight', type=float, default=0.2)
+    parser.add_argument('--mask_rec_weight', type=float, default=3.0)
+    parser.add_argument('--batch_adv_weight', type=float, default=0.1)
+    parser.add_argument('--context_align_weight', type=float, default=0.1)
+    parser.add_argument('--mask_strategy', type=str, default="high_var", choices=["random", "high_var"])
+    parser.add_argument('--kl_anneal_steps', type=int, default=1000)
+    parser.add_argument('--kl_free_bits', type=float, default=0.1)
+    parser.add_argument('--encoder_type', type=str, default="gnn", choices=["gnn", "mlp"])
+    parser.add_argument('--use_scgen_context', action='store_true', default=False)
+    parser.add_argument('--scgen_hf_repo', type=str, default="")
+    parser.add_argument('--scgen_local_dir', type=str, default="")
+    parser.add_argument('--use_scvi_context', action='store_true', default=False)
+    parser.add_argument('--scvi_hf_repo', type=str, default="")
+    parser.add_argument('--scvi_local_dir', type=str, default="")
+    parser.add_argument('--dual_graph', action='store_true', default=True)
     args = parser.parse_args()
 
     BATCH_SIZE = args.batch_size
@@ -470,9 +983,25 @@ if __name__ == '__main__':
     PCA_NEIGHBORS = args.pca_dim
     GENE_THRESHOLD = args.gene_threshold
     TIMESTEPS_DIFFUSION = args.timesteps_diffusion
+    MAX_TIME = args.max_time
     GLOBAL_SEED = args.seed
     VIZ = args.viz
     INPUT_MASKING_FRACTION = args.input_masking_fraction
+    SPECTRAL_LOSS_WEIGHT = args.spectral_loss_weight
+    MASK_REC_WEIGHT = args.mask_rec_weight
+    BATCH_ADV_WEIGHT = args.batch_adv_weight
+    CONTEXT_ALIGN_WEIGHT = args.context_align_weight
+    MASK_STRATEGY = args.mask_strategy
+    KL_ANNEAL_STEPS = args.kl_anneal_steps
+    KL_FREE_BITS = args.kl_free_bits
+    ENCODER_TYPE = args.encoder_type
+    USE_SCGEN_CONTEXT = args.use_scgen_context
+    SCGEN_HF_REPO = args.scgen_hf_repo
+    SCGEN_LOCAL_DIR = args.scgen_local_dir
+    USE_SCVI_CONTEXT = args.use_scvi_context
+    SCVI_HF_REPO = args.scvi_hf_repo
+    SCVI_LOCAL_DIR = args.scvi_local_dir
+    DUAL_GRAPH = args.dual_graph
     
     set_seed(GLOBAL_SEED)
 
@@ -494,7 +1023,7 @@ if __name__ == '__main__':
 
     try:
         print(f"Loading/Processing training data from: {TRAIN_H5AD}")
-        train_dataset = PBMC3KDataset(h5ad_path=TRAIN_H5AD, k_neighbors=K_NEIGHBORS, pe_dim=PE_DIM, root=TRAIN_DATA_ROOT, train=True, gene_threshold=GENE_THRESHOLD, pca_neighbors=PCA_NEIGHBORS, seed=GLOBAL_SEED)
+        train_dataset = LaplaceDataset(h5ad_path=TRAIN_H5AD, k_neighbors=K_NEIGHBORS, pe_dim=PE_DIM, root=TRAIN_DATA_ROOT, train=True, gene_threshold=GENE_THRESHOLD, pca_neighbors=PCA_NEIGHBORS, seed=GLOBAL_SEED, dataset_name='spatial')
         
         if train_dataset and len(train_dataset) > 0:
             num_train_cells = train_dataset.get(0).num_nodes
@@ -502,6 +1031,176 @@ if __name__ == '__main__':
             num_cell_types = train_dataset.num_cell_types
             filtered_gene_names_from_train = train_dataset.filtered_gene_names
             print(f"Training data: {num_train_cells} cells, {input_feature_dim} genes, {num_cell_types} types.")
+            
+            # Check for multimodal context
+        context_dim = 0
+        if hasattr(train_dataset.get(0), 'chromatin') and train_dataset.get(0).chromatin is not None:
+            context_dim = train_dataset.get(0).chromatin.size(1)
+            print(f"Detected Chromatin Context Dim: {context_dim}")
+
+        num_batches = 1
+        mask_gene_probs = None
+        if train_dataset and len(train_dataset) > 0:
+            data0 = train_dataset.get(0)
+            if hasattr(data0, 'batch_id') and data0.batch_id is not None:
+                num_batches = int(data0.batch_id.max().item()) + 1
+            if MASK_STRATEGY == "high_var":
+                x0 = data0.x
+                if x0 is not None and x0.numel() > 0:
+                    var = x0.var(dim=0, unbiased=False)
+                    var = var / (var.mean() + 1e-8)
+                    mask_gene_probs = torch.clamp(var * INPUT_MASKING_FRACTION, max=1.0).detach()
+
+        # Optional: scGen latent as context
+        scgen_context = None
+        scgen_context_stats = None
+        if USE_SCGEN_CONTEXT:
+            try:
+                import numpy as np
+                from anndata import AnnData
+                scgen_path = SCGEN_LOCAL_DIR
+                if not scgen_path and SCGEN_HF_REPO:
+                    try:
+                        from huggingface_hub import snapshot_download
+                        scgen_path = snapshot_download(repo_id=SCGEN_HF_REPO)
+                    except Exception as e:
+                        raise RuntimeError(f"HF download failed: {e}")
+                if not scgen_path:
+                    raise RuntimeError("No scGen path provided (use --scgen_local_dir or --scgen_hf_repo).")
+
+                X_train = train_dataset.get(0).x.cpu().numpy()
+                adata_scgen = AnnData(X=X_train)
+                adata_scgen.var_names = train_dataset.filtered_gene_names if hasattr(train_dataset, 'filtered_gene_names') else None
+                try:
+                    from scvi.model import SCGEN as SCGENModel
+                    scgen_model = SCGENModel.load(scgen_path, adata=adata_scgen)
+                except Exception:
+                    import scgen
+                    scgen_model = scgen.SCGEN.load(scgen_path, adata=adata_scgen)
+
+                scgen_latent = scgen_model.get_latent_representation(adata_scgen)
+                scgen_context = torch.tensor(scgen_latent, device=device).float()
+                train_dataset.get(0).chromatin = scgen_context
+                context_dim = scgen_context.size(1)
+                scgen_context_stats = (scgen_context.mean(dim=0), scgen_context.std(dim=0).clamp(min=1e-6))
+                print(f"Using scGen latent context: {context_dim} dims.")
+            except Exception as e:
+                print(f"Warning: scGen context failed: {e}. Proceeding without scGen.")
+                USE_SCGEN_CONTEXT = False
+
+        # Optional: scVI latent as context
+        scvi_context = None
+        scvi_context_stats = None
+        if USE_SCVI_CONTEXT:
+            try:
+                import numpy as np
+                from anndata import AnnData
+                from pathlib import Path
+                scvi_path = Path(SCVI_LOCAL_DIR) if SCVI_LOCAL_DIR else None
+                if (scvi_path is None or not scvi_path.exists()) and SCVI_HF_REPO:
+                    try:
+                        from huggingface_hub import snapshot_download
+                        scvi_path = Path(snapshot_download(repo_id=SCVI_HF_REPO, cache_dir="scvi_hub_cache"))
+                    except Exception as e:
+                        raise RuntimeError(f"HF download failed: {e}")
+                if scvi_path is None:
+                    raise RuntimeError("No scVI path provided (use --scvi_local_dir or --scvi_hf_repo).")
+
+                import scanpy as sc
+                # load reference genes from scVI snapshot adata
+                ref_adata = sc.read_h5ad(str(scvi_path / "adata.h5ad"))
+                ref_adata.var_names = ref_adata.var_names.astype(str)
+                ref_genes = ref_adata.var_names
+
+                X_train = train_dataset.get(0).x.cpu().numpy()
+                train_genes = train_dataset.filtered_gene_names if hasattr(train_dataset, 'filtered_gene_names') else None
+                if train_genes is None:
+                    raise RuntimeError("Train gene names missing; cannot align to scVI reference.")
+
+                # Align train counts to scVI reference genes
+                gene_to_idx = {g: i for i, g in enumerate(train_genes)}
+                X_aligned = np.zeros((X_train.shape[0], len(ref_genes)), dtype=X_train.dtype)
+                idx_target = []
+                idx_src = []
+                for i, g in enumerate(ref_genes):
+                    if g in gene_to_idx:
+                        idx_target.append(i)
+                        idx_src.append(gene_to_idx[g])
+                if idx_target:
+                    X_aligned[:, idx_target] = X_train[:, idx_src]
+
+                adata_scvi = AnnData(X=X_aligned)
+                adata_scvi.var_names = ref_genes.astype(str)
+
+                from scvi.model import SCVI
+                scvi_model = None
+                attr_path = scvi_path / "attr.pkl"
+                if attr_path.exists():
+                    scvi_model = SCVI.load(scvi_path, adata=adata_scvi)
+                else:
+                    # Fallback: load HF checkpoint directly (scvi-tools <1.0 compatible)
+                    # HF scVI checkpoint is trusted here; use full torch.load to avoid weights_only allowlist issues
+                    ckpt = torch.load(str(scvi_path / "model.pt"), map_location="cpu", weights_only=False)
+                    reg = ckpt.get("attr_dict", {}).get("registry_", {})
+                    x_state = reg.get("field_registries", {}).get("X", {}).get("state_registry", {})
+                    var_names = [str(v) for v in x_state.get("column_names", ref_genes)]
+                    batch_state = reg.get("field_registries", {}).get("batch", {}).get("state_registry", {})
+                    batch_categories = [str(v) for v in batch_state.get("categorical_mapping", ["0"])]
+
+                    gene_to_idx = {g: i for i, g in enumerate(train_genes)}
+                    X_aligned = np.zeros((X_train.shape[0], len(var_names)), dtype=X_train.dtype)
+                    idx_target, idx_src = [], []
+                    for i, g in enumerate(var_names):
+                        if g in gene_to_idx:
+                            idx_target.append(i)
+                            idx_src.append(gene_to_idx[g])
+                    if idx_target:
+                        X_aligned[:, idx_target] = X_train[:, idx_src]
+                    # Filter empty cells to avoid scvi warnings
+                    cell_sums = X_aligned.sum(axis=1)
+                    keep = cell_sums > 0
+                    X_aligned_filt = X_aligned[keep]
+                    adata_scvi = AnnData(X=X_aligned_filt)
+                    adata_scvi.var_names = np.array(var_names, dtype=str)
+                    adata_scvi.obs["batch"] = batch_categories[0]
+                    adata_scvi.obs["batch"] = adata_scvi.obs["batch"].astype("category")
+                    adata_scvi.obs["batch"] = adata_scvi.obs["batch"].cat.set_categories(batch_categories)
+
+                    try:
+                        import scvi
+                        scvi.settings.verbosity = "error"
+                    except Exception:
+                        pass
+                    SCVI.setup_anndata(adata_scvi, batch_key="batch")
+                    init_params = ckpt.get("attr_dict", {}).get("init_params_", {})
+                    non_kwargs = init_params.get("non_kwargs", {})
+                    kw_kwargs = init_params.get("kwargs", {}).get("kwargs", {})
+                    state = ckpt.get("model_state_dict", {})
+                    n_latent = state.get("z_encoder.mean_encoder.weight", torch.empty(0)).shape[0]
+                    n_hidden = state.get("z_encoder.encoder.fc_layers.Layer 0.0.weight", torch.empty(0)).shape[0]
+                    non_kwargs = dict(non_kwargs)
+                    if n_latent > 0:
+                        non_kwargs["n_latent"] = int(n_latent)
+                    if n_hidden > 0:
+                        non_kwargs["n_hidden"] = int(n_hidden)
+                    scvi_model = SCVI(adata_scvi, **non_kwargs, **kw_kwargs)
+                    scvi_model.module.load_state_dict(state, strict=True)
+                    scvi_model.is_trained_ = True
+
+                scvi_latent = scvi_model.get_latent_representation(adata_scvi)
+                scvi_context_full = np.zeros((X_train.shape[0], scvi_latent.shape[1]), dtype=scvi_latent.dtype)
+                scvi_context_full[keep] = scvi_latent
+                scvi_context = torch.tensor(scvi_context_full, device=device).float()
+                train_dataset.get(0).chromatin = scvi_context
+                if hasattr(train_dataset, "_data") and train_dataset._data is not None:
+                    train_dataset._data.chromatin = scvi_context
+                context_dim = scvi_context.size(1)
+                scvi_context_stats = (scvi_context.mean(dim=0), scvi_context.std(dim=0).clamp(min=1e-6))
+                print(f"Using scVI latent context: {context_dim} dims.")
+            except Exception as e:
+                print(f"Warning: scVI context failed: {e}. Proceeding without scVI.")
+                USE_SCVI_CONTEXT = False
+
         else: raise ValueError("Training data is empty.")
     except Exception as e:
         print(f"FATAL ERROR loading training data: {e}"); traceback.print_exc(); sys.exit(1)
@@ -515,14 +1214,30 @@ if __name__ == '__main__':
         WARMUP_STEPS = min(WARMUP_STEPS, TOTAL_TRAINING_STEPS // 2)
 
         trainer = Trainer(in_dim=input_feature_dim, hid_dim=HIDDEN_DIM, lat_dim=LATENT_DIM, num_cell_types=num_cell_types,
-                        pe_dim=PE_DIM, timesteps=TIMESTEPS_DIFFUSION, lr=LEARNING_RATE, warmup_steps=WARMUP_STEPS,
-                        total_steps=TOTAL_TRAINING_STEPS, loss_weights=loss_weights, input_masking_fraction=INPUT_MASKING_FRACTION)
+                        pe_dim=PE_DIM, timesteps=TIMESTEPS_DIFFUSION, max_time=MAX_TIME, lr=LEARNING_RATE, warmup_steps=WARMUP_STEPS,
+                        total_steps=TOTAL_TRAINING_STEPS, loss_weights=loss_weights, input_masking_fraction=INPUT_MASKING_FRACTION,
+                        context_dim=context_dim, dual_graph=DUAL_GRAPH, spectral_loss_weight=SPECTRAL_LOSS_WEIGHT,
+                        mask_rec_weight=MASK_REC_WEIGHT, kl_anneal_steps=KL_ANNEAL_STEPS, kl_free_bits=KL_FREE_BITS,
+                        encoder_type=ENCODER_TYPE, batch_adv_weight=BATCH_ADV_WEIGHT, num_batches=num_batches,
+                        context_align_weight=CONTEXT_ALIGN_WEIGHT, mask_strategy=MASK_STRATEGY, mask_gene_probs=mask_gene_probs)
+        if USE_SCGEN_CONTEXT and scgen_context_stats is not None:
+            trainer.scgen_context_stats = scgen_context_stats
+        if USE_SCVI_CONTEXT and scvi_context_stats is not None:
+            trainer.scvi_context_stats = scvi_context_stats
 
         print(f"\nStarting training for {EPOCHS} epochs...")
-        for epoch in range(1, EPOCHS + 1):
-            avg_total_loss, avg_diff_loss, avg_kl_loss, avg_rec_loss = trainer.train_epoch(train_loader, epoch)
-            print(f"Epoch {epoch:03d}/{EPOCHS} Summary -> AvgTotal: {avg_total_loss:.4f}, AvgDiff: {avg_diff_loss:.4f}, AvgKL: {avg_kl_loss:.4f}, AvgRec: {avg_rec_loss:.4f}, LR: {trainer.optim.param_groups[0]['lr']:.3e}")
-            if epoch % 5 == 0 or epoch == EPOCHS:
+        checkpoint_freq = max(1, int(EPOCHS * 0.1))
+        print(f"Checkpoint frequency: Every {checkpoint_freq} epochs (approx 10% of total time).")
+
+        epoch_bar = tqdm(range(1, EPOCHS + 1), desc="Training", leave=True)
+        for epoch in epoch_bar:
+            (avg_total_loss, avg_diff_loss, avg_kl_loss,
+             avg_rec_loss, avg_mask_loss, avg_spec_loss) = trainer.train_epoch(train_loader, epoch)
+            print(f"Epoch {epoch:03d}/{EPOCHS} Summary -> "
+                  f"Total: {avg_total_loss:.4f}, Diff: {avg_diff_loss:.4f}, KL: {avg_kl_loss:.4f}, "
+                  f"Rec: {avg_rec_loss:.4f}, MaskRec: {avg_mask_loss:.4f}, SpecAlign: {avg_spec_loss:.4f}, "
+                  f"LR: {trainer.optim.param_groups[0]['lr']:.3e}")
+            if epoch % checkpoint_freq == 0 or epoch == EPOCHS:
                 checkpoint_path = os.path.join(TRAIN_DATA_ROOT, f'trainer_checkpoint_epoch_{epoch}.pt')
                 torch.save(trainer.state_dict(), checkpoint_path)
                 print(f"Checkpoint saved at: {checkpoint_path}")
@@ -639,7 +1354,14 @@ if __name__ == '__main__':
         for i in range(3): 
             print(f"Generating dataset {i+1}/3...")
             try:
-                gen_counts, gen_types = trainer.generate(num_samples=test_adata.shape[0], cell_type_condition=cell_type_condition_for_gen)
+                gen_context = None
+                if USE_SCVI_CONTEXT and hasattr(trainer, 'scvi_context_stats'):
+                    mean_ctx, std_ctx = trainer.scvi_context_stats
+                    gen_context = torch.randn((test_adata.shape[0], mean_ctx.numel()), device=device) * std_ctx + mean_ctx
+                elif USE_SCGEN_CONTEXT and hasattr(trainer, 'scgen_context_stats'):
+                    mean_ctx, std_ctx = trainer.scgen_context_stats
+                    gen_context = torch.randn((test_adata.shape[0], mean_ctx.numel()), device=device) * std_ctx + mean_ctx
+                gen_counts, gen_types = trainer.generate(num_samples=test_adata.shape[0], cell_type_condition=cell_type_condition_for_gen, context_embedding=gen_context)
                 generated_datasets_counts.append(gen_counts); generated_datasets_cell_types.append(gen_types)
                 
                 # Evaluation
@@ -651,9 +1373,34 @@ if __name__ == '__main__':
                 tstr = trainer.evaluate_tstr(real_adata=test_adata, generated_counts=gen_counts, generated_cell_types=gen_types)
                 if tstr: print(f"TSTR: {tstr}")
                 
-            except Exception as e_gen: print(f"Error generating/evaluating dataset {i+1}: {e_gen}")
+                # GRN Recovery
+                grn = trainer.evaluate_grn_recovery(real_adata=test_adata, generated_counts=gen_counts)
+                if grn: print(f"GRN: {grn}")
+                
+                # Marker Gene Conservation
+                markers = trainer.evaluate_marker_genes(real_adata=test_adata, generated_counts=gen_counts, generated_cell_types=gen_types)
+                
+            except Exception as e_gen: 
+                print(f"Error generating/evaluating dataset {i+1}: {e_gen}")
+                traceback.print_exc()
+        
+        # Inpainting Verification
+        if VIZ:
+            trainer.evaluate_infill(real_adata=test_adata, mask_fraction=0.2, num_samples=50)
 
-        # Qualitative Plots (last dataset)
+        # interpolation (Geometric Surgery)
+        if VIZ:
+            trainer.evaluate_interpolation(real_adata=test_adata, num_steps=10)
+            
+        # moran's I (Spatial)
+        if 'spatial' in test_adata.obsm:
+            trainer.compute_morans_i(test_adata)
+            trainer.compute_spectral_mismatch(test_adata)
+        else:
+            print("Skipping Moran's I: No 'spatial' coordinates in test_adata (this is expected for synthetic generated data, but we check Real data stats).")
+            pass
+
+        # qualitative plots (last dataset)
         if generated_datasets_counts and VIZ:
              output_plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qualitative_evaluation_plots_v2")
              current_train_cell_type_categories = ["Unknown"]

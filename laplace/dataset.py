@@ -15,8 +15,8 @@ from torch_geometric.data import download_url, extract_zip
 import warnings
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')   
-class PBMC3KDataset(InMemoryDataset):
-    def __init__(self, h5ad_path, k_neighbors=15, pe_dim=10, root='data/pbmc3k', train=True, gene_threshold=20, pca_neighbors=50, seed=42):
+class LaplaceDataset(InMemoryDataset):
+    def __init__(self, h5ad_path, k_neighbors=15, pe_dim=10, root='data/laplace', train=True, gene_threshold=20, pca_neighbors=50, seed=42, dataset_name='laplace'):
         self.h5ad_path = h5ad_path
         self.k_neighbors = k_neighbors
         self.pe_dim = pe_dim
@@ -28,7 +28,7 @@ class PBMC3KDataset(InMemoryDataset):
         self.cell_type_categories = ["Unknown"] # Default
         self.num_cell_types = 1 # Default
 
-        processed_file = f'pbmc3k_{"train" if train else "test"}_k{k_neighbors}_pe{pe_dim}_gt{gene_threshold}_pca{pca_neighbors}.pt'
+        processed_file = f'{dataset_name}_{"train" if train else "test"}_k{k_neighbors}_pe{pe_dim}_gt{gene_threshold}_pca{pca_neighbors}.pt'
         self.processed_file_names_list = [processed_file]
         super().__init__(root=root, transform=None, pre_transform=None)
 
@@ -40,23 +40,29 @@ class PBMC3KDataset(InMemoryDataset):
             if os.path.exists(metadata_path): os.remove(metadata_path)
             self.process()
         try:
-            self.data, self.slices = torch.load(self.processed_paths[0], weights_only=False)
+            data, slices = torch.load(self.processed_paths[0], weights_only=False)
+            self._data = data
+            self.slices = slices
             print(f"Successfully loaded processed data from {self.processed_paths[0]}")
             if os.path.exists(metadata_path):
                 metadata = torch.load(metadata_path, weights_only=False)
                 self.filtered_gene_names = metadata.get('filtered_gene_names', [])
                 self.cell_type_categories = metadata.get('cell_type_categories', ["Unknown"])
                 self.num_cell_types = metadata.get('num_cell_types', 1)
+                self.log_libsize_mean = metadata.get('log_libsize_mean', None)
+                self.log_libsize_std = metadata.get('log_libsize_std', None)
                 print(f"Loaded metadata: {len(self.filtered_gene_names)} filtered gene names, {self.num_cell_types} cell types ({self.cell_type_categories[:5]}...).")
             else:
                 print(f"Warning: Metadata file {metadata_path} not found. Attributes might be default or inferred if possible.")
-                if self.data and hasattr(self.data, 'x') and self.data.x is not None:
-                    if not self.filtered_gene_names and self.data.x.shape[1] > 0 : self.filtered_gene_names = [f"gene_{i}" for i in range(self.data.x.shape[1])]
-                    if hasattr(self.data, 'cell_type') and self.data.cell_type is not None:
-                        unique_codes = torch.unique(self.data.cell_type).cpu().numpy()
+                data_ref = self._data if hasattr(self, "_data") and self._data is not None else None
+                if data_ref and hasattr(data_ref, 'x') and data_ref.x is not None:
+                    if not self.filtered_gene_names and data_ref.x.shape[1] > 0 : self.filtered_gene_names = [f"gene_{i}" for i in range(data_ref.x.shape[1])]
+                    if hasattr(data_ref, 'cell_type') and data_ref.cell_type is not None:
+                        unique_codes = torch.unique(data_ref.cell_type).cpu().numpy()
                         self.num_cell_types = len(unique_codes)
                         self.cell_type_categories = [f"Type_{code}" for code in sorted(unique_codes)]
-            if self.data is None or self.data.num_nodes == 0:
+            data_ref = self._data if hasattr(self, "_data") and self._data is not None else None
+            if data_ref is None or data_ref.num_nodes == 0:
                  print("Warning: Loaded processed data is empty or has no nodes.")
         
         except Exception as e:
@@ -224,6 +230,15 @@ class PBMC3KDataset(InMemoryDataset):
 
         num_genes_after_filtering = counts.shape[1]
         print(f"Number of genes after filtering: {num_genes_after_filtering}")
+        # Library size statistics (for generation scaling)
+        if sp.issparse(counts):
+            libsize = np.asarray(counts.sum(axis=1)).flatten()
+        else:
+            libsize = counts.sum(axis=1)
+        libsize = np.clip(libsize, 1.0, None)
+        log_libsize = np.log(libsize)
+        log_libsize_mean = float(np.mean(log_libsize))
+        log_libsize_std = float(np.std(log_libsize) + 1e-6)
         
         # Check if chromatin_emb exists and matches num_cells (it should if we filtered same adata)
         if chromatin_emb is not None:
@@ -342,6 +357,11 @@ class PBMC3KDataset(InMemoryDataset):
         else:
             x = torch.from_numpy(counts.copy()).float()
         cell_type = torch.from_numpy(cell_type_labels.copy()).long()
+        if isinstance(adata.obs, pd.DataFrame) and 'batch' in adata.obs.columns:
+            batch_ids = pd.Categorical(adata.obs['batch']).codes.astype(np.int64)
+        else:
+            batch_ids = np.zeros(num_cells, dtype=np.int64)
+        batch_id = torch.from_numpy(batch_ids.copy()).long()
         
         if chromatin_emb is None:
              chromatin_emb = torch.zeros((num_cells, 0), dtype=torch.float)
@@ -355,12 +375,14 @@ class PBMC3KDataset(InMemoryDataset):
                     lap_pe=lap_pe, 
                     cell_type=cell_type,
                     chromatin=chromatin_emb, # Added Chromatin Embedding
+                    batch_id=batch_id,
                     num_nodes=num_cells)
 
         if data.x.size(0) != num_cells: print(f"Warning: Data.x size mismatch.")
         if data.lap_pe.size(0) != num_cells: print(f"Warning: Data.lap_pe size mismatch.")
         if data.cell_type.size(0) != num_cells: print(f"Warning: Data.cell_type size mismatch.")
         if data.chromatin.size(0) != num_cells: print(f"Warning: Data.chromatin size mismatch.")
+        if data.batch_id.size(0) != num_cells: print(f"Warning: Data.batch_id size mismatch.")
         if data.edge_index.numel() > 0 and data.edge_index.max() >= num_cells: print(f"Warning: Edge index out of bounds.")
 
         data_list = [data]
@@ -372,7 +394,9 @@ class PBMC3KDataset(InMemoryDataset):
                 'filtered_gene_names': self.filtered_gene_names,
                 'cell_type_categories': self.cell_type_categories,
                 'num_cell_types': self.num_cell_types,
-                'context_dim': chromatin_emb.size(1) # Save context dim
+                'context_dim': chromatin_emb.size(1), # Save context dim
+                'log_libsize_mean': log_libsize_mean,
+                'log_libsize_std': log_libsize_std
             }
             metadata_path = self.processed_paths[0].replace(".pt", "_metadata.pt")
             torch.save(metadata, metadata_path)

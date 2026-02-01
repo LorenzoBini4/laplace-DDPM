@@ -55,24 +55,55 @@ class LaplacianPerturb:
             perturbed_weights = current_weights + epsilon * edge_specific_perturbation_term
         return perturbed_weights.clamp(min=1e-4, max=10.0)
 
+class _GradientReversalFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, lambda_):
+        ctx.lambda_ = lambda_
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return -ctx.lambda_ * grad_output, None
+
+def grad_reverse(x, lambda_=1.0):
+    return _GradientReversalFn.apply(x, lambda_)
+
+class BatchDiscriminator(nn.Module):
+    def __init__(self, in_dim, num_batches):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, max(16, in_dim // 2)),
+            nn.ReLU(),
+            nn.Linear(max(16, in_dim // 2), num_batches),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
 class SpectralEncoder(nn.Module):
-    def __init__(self, in_dim, hid_dim, lat_dim, pe_dim, num_layers=2):
+    def __init__(self, in_dim, hid_dim, lat_dim, pe_dim, num_layers=2, dual_graph: bool = False):
         super().__init__()
         self.pe_dim = pe_dim
         self.num_layers = num_layers
+        self.dual_graph = dual_graph
         self.convs = nn.ModuleList()
+        self.convs_phys = nn.ModuleList() if dual_graph else None
         
         # First layer
         self.convs.append(ChebConv(in_dim + pe_dim, hid_dim, K=4))
+        if self.dual_graph:
+            self.convs_phys.append(ChebConv(in_dim + pe_dim, hid_dim, K=4))
         
         # Hidden layers
         for _ in range(num_layers - 1):
             self.convs.append(ChebConv(hid_dim, hid_dim, K=4))
+            if self.dual_graph:
+                self.convs_phys.append(ChebConv(hid_dim, hid_dim, K=4))
             
         self.mu_net = nn.Linear(hid_dim, lat_dim)
         self.logvar_net = nn.Linear(hid_dim, lat_dim)
 
-    def forward(self, x, edge_index, lap_pe, edge_weight=None):
+    def forward(self, x, edge_index, lap_pe, edge_weight=None, edge_index_phys=None, edge_weight_phys=None):
         current_device = x.device
         num_nodes = x.size(0)
         if num_nodes == 0:
@@ -98,9 +129,56 @@ class SpectralEncoder(nn.Module):
             if edge_weight_sl.dtype != x_combined.dtype: edge_weight_sl = edge_weight_sl.to(x_combined.dtype)
 
         h = x_combined
-        for conv in self.convs:
-            h = F.relu(conv(h, edge_index_sl, edge_weight_sl))
+        for layer_idx, conv in enumerate(self.convs):
+            h_feat = conv(h, edge_index_sl, edge_weight_sl)
+            if self.dual_graph:
+                edge_index_phys_use = edge_index_phys if edge_index_phys is not None else edge_index_sl
+                edge_weight_phys_use = edge_weight_phys if edge_weight_phys is not None else edge_weight_sl
+                # ensure phys graph has valid self-loops
+                if edge_index_phys_use.numel() > 0:
+                    edge_index_phys_sl, edge_weight_phys_sl = torch_geometric.utils.add_self_loops(
+                        edge_index_phys_use, edge_weight_phys_use, num_nodes=num_nodes, fill_value=1.0
+                    )
+                else:
+                    edge_index_phys_sl = torch.arange(num_nodes, device=current_device).repeat(2, 1)
+                    edge_weight_phys_sl = torch.ones(num_nodes, device=current_device, dtype=x.dtype)
+                h_phys = self.convs_phys[layer_idx](h, edge_index_phys_sl, edge_weight_phys_sl)
+                h = F.relu(0.5 * (h_feat + h_phys))
+            else:
+                h = F.relu(h_feat)
             
+        mu = self.mu_net(h)
+        logvar = self.logvar_net(h)
+        return mu, logvar
+
+class MLPEncoder(nn.Module):
+    def __init__(self, in_dim, hid_dim, lat_dim, pe_dim=0, num_layers=3):
+        super().__init__()
+        self.pe_dim = pe_dim
+        input_dim = in_dim + pe_dim
+        layers = []
+        layers.append(nn.Linear(input_dim, hid_dim))
+        layers.append(nn.LayerNorm(hid_dim))
+        layers.append(nn.ReLU())
+        for _ in range(num_layers - 2):
+            layers.append(nn.Linear(hid_dim, hid_dim))
+            layers.append(nn.LayerNorm(hid_dim))
+            layers.append(nn.ReLU())
+        self.mlp = nn.Sequential(*layers)
+        self.mu_net = nn.Linear(hid_dim, lat_dim)
+        self.logvar_net = nn.Linear(hid_dim, lat_dim)
+
+    def forward(self, x, edge_index=None, lap_pe=None, edge_weight=None, edge_index_phys=None, edge_weight_phys=None):
+        current_device = x.device
+        num_nodes = x.size(0)
+        if num_nodes == 0:
+            return torch.empty(0, self.mu_net.out_features, device=current_device, dtype=x.dtype), \
+                    torch.empty(0, self.logvar_net.out_features, device=current_device, dtype=x.dtype)
+
+        if lap_pe is None or lap_pe.size(0) != num_nodes or lap_pe.size(1) != self.pe_dim:
+            lap_pe = torch.zeros(num_nodes, self.pe_dim, device=current_device, dtype=x.dtype)
+        x_combined = torch.cat([x, lap_pe], dim=1)
+        h = self.mlp(x_combined)
         mu = self.mu_net(h)
         logvar = self.logvar_net(h)
         return mu, logvar
@@ -347,3 +425,48 @@ class FeatureDecoder(nn.Module):
         log_mu = params[:, :self.out_dim]
         log_theta = params[:, self.out_dim:] # log_theta for numerical stability
         return log_mu, log_theta
+
+class GeneDecoder(nn.Module):
+    def __init__(self, lat_dim, hid_dim, out_dim, num_layers=3, zinb=False, use_libsize=False):
+        super().__init__()
+        self.out_dim = out_dim
+        self.zinb = zinb
+        self.use_libsize = use_libsize
+        out_mult = 3 if zinb else 2
+
+        layers = []
+        layers.append(nn.Linear(lat_dim, hid_dim))
+        layers.append(nn.LayerNorm(hid_dim))
+        layers.append(nn.ReLU())
+        for _ in range(num_layers - 2):
+            layers.append(nn.Linear(hid_dim, hid_dim))
+            layers.append(nn.LayerNorm(hid_dim))
+            layers.append(nn.ReLU())
+        layers.append(nn.Linear(hid_dim, out_mult * out_dim))
+        self.decoder_mlp = nn.Sequential(*layers)
+
+        if use_libsize:
+            self.libsize_head = nn.Sequential(
+                nn.Linear(lat_dim, hid_dim // 2),
+                nn.ReLU(),
+                nn.Linear(hid_dim // 2, 1)
+            )
+        else:
+            self.libsize_head = None
+
+    def forward(self, z):
+        if z.size(0) == 0:
+            empty = torch.empty(0, self.out_dim, device=z.device, dtype=z.dtype)
+            if self.zinb:
+                logit_pi = torch.empty(0, self.out_dim, device=z.device, dtype=z.dtype)
+            else:
+                logit_pi = None
+            log_libsize = torch.empty(0, 1, device=z.device, dtype=z.dtype) if self.use_libsize else None
+            return empty, empty, logit_pi, log_libsize
+
+        params = self.decoder_mlp(z)
+        log_mu = params[:, :self.out_dim]
+        log_theta = params[:, self.out_dim:2 * self.out_dim]
+        logit_pi = params[:, 2 * self.out_dim:] if self.zinb else None
+        log_libsize = self.libsize_head(z) if self.use_libsize else None
+        return log_mu, log_theta, logit_pi, log_libsize
