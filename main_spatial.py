@@ -9,6 +9,7 @@ import scipy.sparse as sp
 from scipy.sparse.linalg import eigsh
 import os
 import traceback
+import glob
 import scanpy as sc
 from sklearn.decomposition import PCA
 from scipy.spatial.distance import cdist 
@@ -107,7 +108,9 @@ class Trainer:
                  dual_graph=True, spectral_loss_weight=0.1, mask_rec_weight=1.0,
                  kl_anneal_steps=1000, kl_free_bits=0.1, encoder_type="gnn",
                  batch_adv_weight=0.0, num_batches=1, context_align_weight=0.0,
-                 mask_strategy="random", mask_gene_probs=None): # Added context_dim
+                 mask_strategy="random", mask_gene_probs=None,
+                 gene_stats_weight=0.0, zero_rate_weight=0.0,
+                 gene_stats_anneal_steps=1000, zero_rate_anneal_steps=1000): # Added context_dim
         print("\nInitializing Trainer...")
         self.encoder_type = encoder_type
         if encoder_type == "mlp":
@@ -125,6 +128,10 @@ class Trainer:
         self.context_align_weight = context_align_weight
         self.mask_strategy = mask_strategy
         self.mask_gene_probs = mask_gene_probs
+        self.gene_stats_weight = gene_stats_weight
+        self.zero_rate_weight = zero_rate_weight
+        self.gene_stats_anneal_steps = max(1, int(gene_stats_anneal_steps))
+        self.zero_rate_anneal_steps = max(1, int(zero_rate_anneal_steps))
         self.batch_discriminator = None
         self.ctx_proj = None
         if num_batches > 1 and batch_adv_weight > 0.0:
@@ -156,6 +163,8 @@ class Trainer:
         print(f"KL anneal steps: {self.kl_anneal_steps}, KL free bits: {self.kl_free_bits}")
         print(f"Batch adv weight: {self.batch_adv_weight}, Context align weight: {self.context_align_weight}")
         print(f"Mask strategy: {self.mask_strategy}")
+        print(f"Gene stats weight: {self.gene_stats_weight}, Zero-rate weight: {self.zero_rate_weight}")
+        print(f"Gene stats anneal steps: {self.gene_stats_anneal_steps}, Zero-rate anneal steps: {self.zero_rate_anneal_steps}")
 
         num_warmup_steps_captured = warmup_steps
         num_training_steps_captured = total_steps
@@ -177,6 +186,7 @@ class Trainer:
         self.encoder.train(); self.denoiser.train(); self.decoder.train()
         total_loss_val, total_loss_diff_val, total_loss_kl_val, total_loss_rec_val = 0.0, 0.0, 0.0, 0.0
         total_loss_mask_val, total_loss_spec_val = 0.0, 0.0
+        total_gene_stats_val, total_zero_rate_val = 0.0, 0.0
         num_batches_processed = 0
 
         # TQDM Wrapper
@@ -288,7 +298,7 @@ class Trainer:
                 # ZINB loss
                 probs_rec = mu_rec / (mu_rec + theta_rec + 1e-6)
                 probs_rec = torch.clamp(probs_rec, min=1e-4, max=1.0 - 1e-4)
-                nb_dist = dist.NegativeBinomial(total_count=theta_rec, probs=probs_rec)
+                nb_dist = dist.NegativeBinomial(total_count=theta_rec, probs=probs_rec, validate_args=False)
                 log_nb = nb_dist.log_prob(target_counts)
                 if logit_pi_rec is None:
                     loss_rec = -log_nb.mean()
@@ -314,7 +324,7 @@ class Trainer:
                     masked_mu = mu_rec[mask]
                     masked_theta = theta_rec[mask]
                     probs_mask = torch.clamp(masked_mu / (masked_mu + masked_theta + 1e-6), 1e-6, 1-1e-6)
-                    nb_mask = dist.NegativeBinomial(total_count=masked_theta, probs=probs_mask)
+                    nb_mask = dist.NegativeBinomial(total_count=masked_theta, probs=probs_mask, validate_args=False)
                     if logit_pi_rec is None:
                         loss_mask = -nb_mask.log_prob(masked_target).mean()
                     else:
@@ -336,6 +346,31 @@ class Trainer:
                     mu_phys = laplacian_smooth(mu, edge_index_phys, phys_weights)
                     spectral_loss = F.mse_loss(mu_feat, mu_phys)
 
+                # gene-wise mean/variance + zero-rate calibration (biologically grounded)
+                gene_stats_loss = torch.tensor(0.0, device=device)
+                zero_rate_loss = torch.tensor(0.0, device=device)
+                if (self.gene_stats_weight > 0.0 or self.zero_rate_weight > 0.0) and hasattr(self, 'gene_mean'):
+                    target_mean = self.gene_mean.to(mu_rec.device)
+                    target_var = self.gene_var.to(mu_rec.device) if hasattr(self, 'gene_var') and self.gene_var is not None else None
+                    if logit_pi_rec is None:
+                        pi_eff = torch.zeros_like(mu_rec)
+                    else:
+                        pi_eff = torch.sigmoid(logit_pi_rec)
+                    exp_mean = (1.0 - pi_eff) * mu_rec
+                    if target_var is not None:
+                        nb_var = mu_rec + (mu_rec ** 2) / (theta_rec + 1e-6)
+                        exp_var = (1.0 - pi_eff) * nb_var + pi_eff * (0.0 - exp_mean) ** 2
+                        mean_loss = F.mse_loss(torch.log1p(exp_mean.mean(dim=0)), torch.log1p(target_mean))
+                        var_loss = F.mse_loss(torch.log1p(exp_var.mean(dim=0)), torch.log1p(target_var))
+                        gene_stats_loss = mean_loss + var_loss
+                    else:
+                        gene_stats_loss = F.mse_loss(torch.log1p(exp_mean.mean(dim=0)), torch.log1p(target_mean))
+                    if hasattr(self, 'zero_rate') and self.zero_rate is not None:
+                        target_zero = self.zero_rate.to(mu_rec.device)
+                        zero_nb = torch.exp(theta_rec * (torch.log(theta_rec + 1e-6) - torch.log(theta_rec + mu_rec + 1e-6)))
+                        exp_zero = pi_eff + (1.0 - pi_eff) * zero_nb
+                        zero_rate_loss = F.mse_loss(exp_zero.mean(dim=0), target_zero)
+
                 # cross-modal alignment (context -> latent)
                 context_align_loss = torch.tensor(0.0, device=device)
                 if self.ctx_proj is not None and context_embedding is not None:
@@ -349,11 +384,15 @@ class Trainer:
                     batch_adv_loss = F.cross_entropy(batch_logits, data.batch_id)
 
                 kl_weight = min(1.0, self.current_step / self.kl_anneal_steps) * self.loss_weights['kl']
+                gene_stats_scale = min(1.0, float(self.current_step) / float(self.gene_stats_anneal_steps))
+                zero_rate_scale = min(1.0, float(self.current_step) / float(self.zero_rate_anneal_steps))
                 final_loss = (self.loss_weights['diff'] * loss_diff + 
                               kl_weight * kl_div + 
                               self.loss_weights['rec'] * loss_rec +
                               self.mask_rec_weight * loss_mask +
                               self.spectral_loss_weight * spectral_loss +
+                              gene_stats_scale * self.gene_stats_weight * gene_stats_loss +
+                              zero_rate_scale * self.zero_rate_weight * zero_rate_loss +
                               self.context_align_weight * context_align_loss +
                               self.batch_adv_weight * batch_adv_loss +
                               0.1 * loss_libsize)
@@ -380,6 +419,8 @@ class Trainer:
             total_loss_rec_val += loss_rec.item()
             total_loss_mask_val += loss_mask.item()
             total_loss_spec_val += spectral_loss.item()
+            total_gene_stats_val += gene_stats_loss.item() if torch.is_tensor(gene_stats_loss) else float(gene_stats_loss)
+            total_zero_rate_val += zero_rate_loss.item() if torch.is_tensor(zero_rate_loss) else float(zero_rate_loss)
             num_batches_processed +=1
 
         if num_batches_processed > 0:
@@ -389,10 +430,12 @@ class Trainer:
             avg_rec_loss = total_loss_rec_val / num_batches_processed
             avg_mask_loss = total_loss_mask_val / num_batches_processed
             avg_spec_loss = total_loss_spec_val / num_batches_processed
-            return avg_total_loss, avg_diff_loss, avg_kl_loss, avg_rec_loss, avg_mask_loss, avg_spec_loss # Return all for detailed logging
+            avg_gene_stats = total_gene_stats_val / num_batches_processed
+            avg_zero_rate = total_zero_rate_val / num_batches_processed
+            return avg_total_loss, avg_diff_loss, avg_kl_loss, avg_rec_loss, avg_mask_loss, avg_spec_loss, avg_gene_stats, avg_zero_rate
         else:
             print(f"Warning: No batches processed in epoch {current_epoch_num}.")
-            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
     def state_dict(self):
         return {
@@ -411,8 +454,12 @@ class Trainer:
         self.denoiser.eval(); self.decoder.eval()
 
         if cell_type_condition is None or self.denoiser.num_cell_types <= 1:
-            print("Generating unconditionally.")
-            gen_cell_type_labels_tensor = torch.zeros(num_samples, dtype=torch.long, device=device)
+            if hasattr(self, 'cell_type_probs') and self.cell_type_probs is not None and self.denoiser.num_cell_types > 1:
+                probs = self.cell_type_probs.to(device)
+                gen_cell_type_labels_tensor = torch.multinomial(probs, num_samples, replacement=True)
+            else:
+                print("Generating unconditionally.")
+                gen_cell_type_labels_tensor = torch.zeros(num_samples, dtype=torch.long, device=device)
         else:
             if isinstance(cell_type_condition, (list, np.ndarray)): gen_cell_type_labels_tensor = torch.tensor(cell_type_condition, dtype=torch.long, device=device)
             elif isinstance(cell_type_condition, torch.Tensor): gen_cell_type_labels_tensor = cell_type_condition.to(device).long()
@@ -437,7 +484,7 @@ class Trainer:
         # clamp theta for stability during sampling
         theta_gen = torch.clamp(theta_gen, min=1e-6, max=1e6)
 
-        # optional library size scaling (use predicted head if available)
+        # library size scaling (prefer training distribution if available)
         if log_libsize_pred is not None:
             libsize_target = torch.exp(log_libsize_pred).clamp(min=1.0)
             mu_sum = mu_gen.sum(dim=1, keepdim=True).clamp(min=1.0)
@@ -863,6 +910,8 @@ class Trainer:
             # identify markers in real data
             print("Identifying Marker Genes in Real Data (Naive approach)...")
             real_adata_raw = real_adata.copy()
+            if not pd.api.types.is_categorical_dtype(real_adata_raw.obs['cell_type']):
+                real_adata_raw.obs['cell_type'] = real_adata_raw.obs['cell_type'].astype('category')
             if sp.issparse(real_adata_raw.X): real_adata_raw.X = real_adata_raw.X.toarray()
             
             sc.pp.normalize_total(real_adata_raw, target_sum=1e4)
@@ -961,6 +1010,13 @@ if __name__ == '__main__':
     parser.add_argument('--batch_adv_weight', type=float, default=0.1)
     parser.add_argument('--context_align_weight', type=float, default=0.1)
     parser.add_argument('--mask_strategy', type=str, default="high_var", choices=["random", "high_var"])
+    parser.add_argument('--gene_stats_weight', type=float, default=1.0)
+    parser.add_argument('--zero_rate_weight', type=float, default=1.0)
+    parser.add_argument('--gene_stats_anneal_steps', type=int, default=2000)
+    parser.add_argument('--zero_rate_anneal_steps', type=int, default=2000)
+    parser.add_argument('--early_stop_gene_stats', action='store_true', default=False)
+    parser.add_argument('--early_stop_patience', type=int, default=20)
+    parser.add_argument('--early_stop_min_delta', type=float, default=1e-4)
     parser.add_argument('--kl_anneal_steps', type=int, default=1000)
     parser.add_argument('--kl_free_bits', type=float, default=0.1)
     parser.add_argument('--encoder_type', type=str, default="gnn", choices=["gnn", "mlp"])
@@ -971,6 +1027,8 @@ if __name__ == '__main__':
     parser.add_argument('--scvi_hf_repo', type=str, default="")
     parser.add_argument('--scvi_local_dir', type=str, default="")
     parser.add_argument('--dual_graph', action='store_true', default=True)
+    parser.add_argument('--eval_only', action='store_true', default=False)
+    parser.add_argument('--checkpoint_path', type=str, default="")
     args = parser.parse_args()
 
     BATCH_SIZE = args.batch_size
@@ -992,6 +1050,13 @@ if __name__ == '__main__':
     BATCH_ADV_WEIGHT = args.batch_adv_weight
     CONTEXT_ALIGN_WEIGHT = args.context_align_weight
     MASK_STRATEGY = args.mask_strategy
+    GENE_STATS_WEIGHT = args.gene_stats_weight
+    ZERO_RATE_WEIGHT = args.zero_rate_weight
+    GENE_STATS_ANNEAL = args.gene_stats_anneal_steps
+    ZERO_RATE_ANNEAL = args.zero_rate_anneal_steps
+    EARLY_STOP_GENE_STATS = args.early_stop_gene_stats
+    EARLY_STOP_PATIENCE = args.early_stop_patience
+    EARLY_STOP_MIN_DELTA = args.early_stop_min_delta
     KL_ANNEAL_STEPS = args.kl_anneal_steps
     KL_FREE_BITS = args.kl_free_bits
     ENCODER_TYPE = args.encoder_type
@@ -1002,6 +1067,8 @@ if __name__ == '__main__':
     SCVI_HF_REPO = args.scvi_hf_repo
     SCVI_LOCAL_DIR = args.scvi_local_dir
     DUAL_GRAPH = args.dual_graph
+    EVAL_ONLY = args.eval_only
+    CHECKPOINT_PATH = args.checkpoint_path
     
     set_seed(GLOBAL_SEED)
 
@@ -1219,33 +1286,86 @@ if __name__ == '__main__':
                         context_dim=context_dim, dual_graph=DUAL_GRAPH, spectral_loss_weight=SPECTRAL_LOSS_WEIGHT,
                         mask_rec_weight=MASK_REC_WEIGHT, kl_anneal_steps=KL_ANNEAL_STEPS, kl_free_bits=KL_FREE_BITS,
                         encoder_type=ENCODER_TYPE, batch_adv_weight=BATCH_ADV_WEIGHT, num_batches=num_batches,
-                        context_align_weight=CONTEXT_ALIGN_WEIGHT, mask_strategy=MASK_STRATEGY, mask_gene_probs=mask_gene_probs)
+                        context_align_weight=CONTEXT_ALIGN_WEIGHT, mask_strategy=MASK_STRATEGY, mask_gene_probs=mask_gene_probs,
+                        gene_stats_weight=GENE_STATS_WEIGHT, zero_rate_weight=ZERO_RATE_WEIGHT,
+                        gene_stats_anneal_steps=GENE_STATS_ANNEAL, zero_rate_anneal_steps=ZERO_RATE_ANNEAL)
         if USE_SCGEN_CONTEXT and scgen_context_stats is not None:
             trainer.scgen_context_stats = scgen_context_stats
         if USE_SCVI_CONTEXT and scvi_context_stats is not None:
             trainer.scvi_context_stats = scvi_context_stats
+        if train_dataset and len(train_dataset) > 0:
+            data0 = train_dataset.get(0)
+            if hasattr(train_dataset, 'log_libsize_mean') and train_dataset.log_libsize_mean is not None:
+                trainer.log_libsize_mean = train_dataset.log_libsize_mean
+                trainer.log_libsize_std = train_dataset.log_libsize_std
+            if hasattr(data0, 'x') and data0.x is not None and data0.x.numel() > 0:
+                x0f = data0.x.float()
+                trainer.zero_rate = (x0f == 0).float().mean(dim=0).cpu()
+                trainer.pi_blend = 0.8
+                trainer.gene_mean = x0f.mean(dim=0).cpu()
+                trainer.gene_var = x0f.var(dim=0, unbiased=False).cpu()
+                trainer.libsize_values = x0f.sum(dim=1).cpu().clamp(min=1.0)
+            if hasattr(data0, 'cell_type') and data0.cell_type is not None:
+                counts = torch.bincount(data0.cell_type, minlength=num_cell_types).float()
+                trainer.cell_type_probs = (counts / counts.sum()).cpu()
 
-        print(f"\nStarting training for {EPOCHS} epochs...")
-        checkpoint_freq = max(1, int(EPOCHS * 0.1))
-        print(f"Checkpoint frequency: Every {checkpoint_freq} epochs (approx 10% of total time).")
+        def _resolve_checkpoint_path():
+            if CHECKPOINT_PATH:
+                return CHECKPOINT_PATH
+            final_path = os.path.join(TRAIN_DATA_ROOT, 'trainer_final_state.pt')
+            if os.path.exists(final_path):
+                return final_path
+            ckpts = sorted(glob.glob(os.path.join(TRAIN_DATA_ROOT, "trainer_checkpoint_epoch_*.pt")))
+            return ckpts[-1] if ckpts else ""
+
+        if EVAL_ONLY:
+            ckpt_path = _resolve_checkpoint_path()
+            if ckpt_path:
+                state = torch.load(ckpt_path, map_location="cpu")
+                def _load_matching(model, sd):
+                    msd = model.state_dict()
+                    filtered = {k: v for k, v in sd.items() if k in msd and msd[k].shape == v.shape}
+                    model.load_state_dict(filtered, strict=False)
+                _load_matching(trainer.encoder, state.get('encoder', {}))
+                _load_matching(trainer.denoiser, state.get('denoiser', {}))
+                _load_matching(trainer.decoder, state.get('decoder', {}))
+                print(f"Loaded checkpoint for eval-only: {ckpt_path}")
+            else:
+                print("Warning: eval_only requested but no checkpoint found. Using current weights.")
+        else:
+            print(f"\nStarting training for {EPOCHS} epochs...")
+            checkpoint_freq = max(1, int(EPOCHS * 0.1))
+            print(f"Checkpoint frequency: Every {checkpoint_freq} epochs (approx 10% of total time).")
 
         epoch_bar = tqdm(range(1, EPOCHS + 1), desc="Training", leave=True)
+        best_gene_stats = float("inf")
+        no_improve = 0
         for epoch in epoch_bar:
             (avg_total_loss, avg_diff_loss, avg_kl_loss,
-             avg_rec_loss, avg_mask_loss, avg_spec_loss) = trainer.train_epoch(train_loader, epoch)
+             avg_rec_loss, avg_mask_loss, avg_spec_loss, avg_gene_stats, avg_zero_rate) = trainer.train_epoch(train_loader, epoch)
             print(f"Epoch {epoch:03d}/{EPOCHS} Summary -> "
                   f"Total: {avg_total_loss:.4f}, Diff: {avg_diff_loss:.4f}, KL: {avg_kl_loss:.4f}, "
                   f"Rec: {avg_rec_loss:.4f}, MaskRec: {avg_mask_loss:.4f}, SpecAlign: {avg_spec_loss:.4f}, "
+                  f"GeneStats: {avg_gene_stats:.4f}, ZeroRate: {avg_zero_rate:.4f}, "
                   f"LR: {trainer.optim.param_groups[0]['lr']:.3e}")
+            if EARLY_STOP_GENE_STATS:
+                if avg_gene_stats + EARLY_STOP_MIN_DELTA < best_gene_stats:
+                    best_gene_stats = avg_gene_stats
+                    no_improve = 0
+                else:
+                    no_improve += 1
+                if no_improve >= EARLY_STOP_PATIENCE:
+                    print(f"Early stopping: gene_stats did not improve for {EARLY_STOP_PATIENCE} epochs.")
+                    break
             if epoch % checkpoint_freq == 0 or epoch == EPOCHS:
                 checkpoint_path = os.path.join(TRAIN_DATA_ROOT, f'trainer_checkpoint_epoch_{epoch}.pt')
                 torch.save(trainer.state_dict(), checkpoint_path)
                 print(f"Checkpoint saved at: {checkpoint_path}")
-        
-        final_checkpoint_path = os.path.join(TRAIN_DATA_ROOT, 'trainer_final_state.pt')
-        torch.save(trainer.state_dict(), final_checkpoint_path)
-        print(f"Final trainer state saved at: {final_checkpoint_path}")
-        print("\nTraining completed.")
+            
+            final_checkpoint_path = os.path.join(TRAIN_DATA_ROOT, 'trainer_final_state.pt')
+            torch.save(trainer.state_dict(), final_checkpoint_path)
+            print(f"Final trainer state saved at: {final_checkpoint_path}")
+            print("\nTraining completed.")
     else: print("\nSkipping training: Training data empty.")
 
     print("\n--- Starting Final Evaluation on Test Set ---")
@@ -1414,6 +1534,12 @@ if __name__ == '__main__':
                  train_filtered_gene_names=filtered_gene_names_from_train,
                  output_dir=output_plot_dir,
                  umap_neighbors=K_NEIGHBORS,
+                 model_name="LapDDPM"
+             )
+             plot_zero_rate_calibration(
+                 real_adata_filtered=test_adata,
+                 generated_counts=generated_datasets_counts[-1],
+                 output_dir=output_plot_dir,
                  model_name="LapDDPM"
              )
     

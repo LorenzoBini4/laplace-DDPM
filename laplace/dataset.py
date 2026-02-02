@@ -3,6 +3,7 @@ import traceback
 import numpy as np
 import pandas as pd
 import scanpy as sc
+import warnings
 import scipy.sparse as sp
 import torch
 from torch_geometric.data import InMemoryDataset, Data
@@ -247,10 +248,25 @@ class LaplaceDataset(InMemoryDataset):
                  chromatin_emb = None
 
         if 'cell_type' not in adata.obs.columns:
-             print("Warning: 'cell_type' not found in adata.obs.columns. Proceeding without cell type labels.")
+             print("Warning: 'cell_type' not found in adata.obs.columns. Deriving pseudo-labels with Leiden.")
              cell_type_labels = np.zeros(num_cells, dtype=int)
              num_cell_types = 1
              cell_type_categories = ["Unknown"]
+             try:
+                 adata_tmp = sc.AnnData(X=counts)
+                 with warnings.catch_warnings():
+                     warnings.filterwarnings("ignore", message="Some cells have zero counts", category=UserWarning)
+                     sc.pp.normalize_total(adata_tmp, target_sum=1e4)
+                 sc.pp.log1p(adata_tmp)
+                 sc.pp.pca(adata_tmp, n_comps=min(50, adata_tmp.shape[1] - 1))
+                 sc.pp.neighbors(adata_tmp, n_neighbors=min(15, adata_tmp.shape[0] - 1))
+                 sc.tl.leiden(adata_tmp, resolution=1.0)
+                 cell_type_series = adata_tmp.obs['leiden'].astype('category')
+                 cell_type_labels = cell_type_series.cat.codes.values
+                 num_cell_types = len(cell_type_series.cat.categories)
+                 cell_type_categories = cell_type_series.cat.categories.tolist()
+             except Exception as e:
+                 print(f"Warning: Leiden pseudo-labeling failed: {e}. Using Unknown label.")
         else:
             cell_type_series = adata.obs['cell_type']
             if not pd.api.types.is_categorical_dtype(cell_type_series):

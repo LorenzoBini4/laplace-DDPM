@@ -1,6 +1,7 @@
 import os   
 import numpy as np  
 import pandas as pd 
+import torch
 import scanpy as sc
 import anndata as ad
 import matplotlib.pyplot as plt
@@ -227,3 +228,43 @@ def generate_qualitative_plots(real_adata_filtered, generated_counts, generated_
             pass # directory might not be empty if other plots are saved there by scanpy
             
     print(f"Qualitative plotting for {model_name} finished.")
+
+def plot_zero_rate_calibration(real_adata_filtered, generated_counts, output_dir="qualitative_plots", model_name="Our Model"):
+    """
+    Plot per-gene zero-rate calibration between real and generated data.
+    """
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        real_counts = real_adata_filtered.X
+        if sp.issparse(real_counts): real_counts = real_counts.toarray()
+        gen_counts = generated_counts.cpu().numpy() if isinstance(generated_counts, torch.Tensor) else generated_counts
+        if sp.issparse(gen_counts): gen_counts = gen_counts.toarray()
+        if real_counts.shape[1] != gen_counts.shape[1]:
+            print("Skipping zero-rate calibration: gene dimension mismatch.")
+            return
+        zero_real = (real_counts == 0).mean(axis=0)
+        zero_gen = (gen_counts == 0).mean(axis=0)
+
+        plt.figure(figsize=(6, 6))
+        plt.scatter(zero_real, zero_gen, s=6, alpha=0.4)
+        plt.plot([0, 1], [0, 1], 'k--', linewidth=1)
+        plt.xlabel("Real zero-rate (per gene)")
+        plt.ylabel("Generated zero-rate (per gene)")
+        plt.title("Zero-rate Calibration (Per Gene)")
+        scatter_path = os.path.join(output_dir, f"figure3_zero_rate_scatter_{model_name.replace(' ', '_')}.png")
+        plt.savefig(scatter_path, dpi=200, bbox_inches='tight')
+        plt.close()
+
+        plt.figure(figsize=(6, 4))
+        diff = zero_gen - zero_real
+        plt.hist(diff, bins=50, color='steelblue', alpha=0.8)
+        plt.axvline(0.0, color='k', linestyle='--', linewidth=1)
+        plt.xlabel("Generated - Real zero-rate")
+        plt.ylabel("Count (genes)")
+        plt.title("Zero-rate Difference Histogram")
+        hist_path = os.path.join(output_dir, f"figure3_zero_rate_hist_{model_name.replace(' ', '_')}.png")
+        plt.savefig(hist_path, dpi=200, bbox_inches='tight')
+        plt.close()
+        print(f"Zero-rate calibration plots saved to {scatter_path} and {hist_path}")
+    except Exception as e:
+        print(f"Error zero-rate calibration: {e}")
