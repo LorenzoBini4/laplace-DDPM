@@ -11,6 +11,7 @@
 #SBATCH --time 0-00:59:59
 
 nvidia-smi
+
 conda run -n lrgb python3 main_multiome.py --eval_only \
     --checkpoint_path data/multiome_processed/train_k5/trainer_final_state.pt \
     --use_scvi_context --scvi_local_dir scvi_hub_cache/models--scvi-tools--tabula-sapiens-blood-scvi/snapshots/24aaac3d6a67620280c0438c046737c88423f4e7 \

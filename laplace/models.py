@@ -304,12 +304,12 @@ class ScoreSDE(nn.Module):
         return torch.sqrt(1. - torch.exp(-2 * t) + 1e-8)
 
     @torch.no_grad()
-    def sample(self, z_shape, cell_type_labels=None, context_embedding=None):
+    def sample(self, z_shape, cell_type_labels=None, context_embedding=None, temperature=1.0):
         current_device = self.timesteps.device
         num_samples, lat_dim = z_shape
         if num_samples == 0: return torch.empty(z_shape, device=current_device, dtype=torch.float32)
 
-        z = torch.randn(z_shape, device=current_device, dtype=torch.float32)
+        z = torch.randn(z_shape, device=current_device, dtype=torch.float32) * float(temperature)
         dt = self.T / self.N
 
         if cell_type_labels is not None:
@@ -330,10 +330,10 @@ class ScoreSDE(nn.Module):
             drift = 2 * predicted_epsilon / sigma_t_safe
             diffusion_coeff_input = torch.tensor(2 * dt + 1e-8, device=current_device, dtype=z.dtype)
             diffusion_coeff = torch.sqrt(diffusion_coeff_input)
-            z = z + drift * dt + diffusion_coeff * torch.randn_like(z)
+            z = z + drift * dt + diffusion_coeff * torch.randn_like(z) * float(temperature)
         return z
 
-    def sample_guided(self, z_shape, guidance_fn, cell_type_labels=None, context_embedding=None, guidance_scale=1.0):
+    def sample_guided(self, z_shape, guidance_fn, cell_type_labels=None, context_embedding=None, guidance_scale=1.0, temperature=1.0):
         """
         Samples with gradient-based guidance (e.g. for Inverse Problems / Inpainting).
         guidance_fn: callable(z_t, t_val) -> grad_term (tensor of shape z)
@@ -343,7 +343,7 @@ class ScoreSDE(nn.Module):
         num_samples, lat_dim = z_shape
         if num_samples == 0: return torch.empty(z_shape, device=current_device, dtype=torch.float32)
 
-        z = torch.randn(z_shape, device=current_device, dtype=torch.float32)
+        z = torch.randn(z_shape, device=current_device, dtype=torch.float32) * float(temperature)
         dt = self.T / self.N
 
         if cell_type_labels is not None:
@@ -387,7 +387,7 @@ class ScoreSDE(nn.Module):
                 diffusion_coeff_input = torch.tensor(2 * dt + 1e-8, device=current_device, dtype=z.dtype)
                 diffusion_coeff = torch.sqrt(diffusion_coeff_input)
                 
-                z = z + drift * dt + diffusion_coeff * torch.randn_like(z)
+                z = z + drift * dt + diffusion_coeff * torch.randn_like(z) * float(temperature)
                 z = z.detach()
 
         return z

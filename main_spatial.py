@@ -110,7 +110,10 @@ class Trainer:
                  batch_adv_weight=0.0, num_batches=1, context_align_weight=0.0,
                  mask_strategy="random", mask_gene_probs=None,
                  gene_stats_weight=0.0, zero_rate_weight=0.0,
-                 gene_stats_anneal_steps=1000, zero_rate_anneal_steps=1000): # Added context_dim
+                 gene_stats_anneal_steps=1000, zero_rate_anneal_steps=1000,
+                 disable_kl=False,
+                 cell_type_loss_weight=0.0, dispersion_weight=0.0,
+                 pi_temperature=1.0, pi_bias=0.0, pi_blend=0.8, diffusion_temperature=1.0): # Added context_dim
         print("\nInitializing Trainer...")
         self.encoder_type = encoder_type
         if encoder_type == "mlp":
@@ -132,8 +135,16 @@ class Trainer:
         self.zero_rate_weight = zero_rate_weight
         self.gene_stats_anneal_steps = max(1, int(gene_stats_anneal_steps))
         self.zero_rate_anneal_steps = max(1, int(zero_rate_anneal_steps))
+        self.disable_kl = disable_kl
+        self.cell_type_loss_weight = cell_type_loss_weight
+        self.dispersion_weight = dispersion_weight
+        self.pi_temperature = pi_temperature
+        self.pi_bias = pi_bias
+        self.pi_blend = pi_blend
+        self.diffusion_temperature = diffusion_temperature
         self.batch_discriminator = None
         self.ctx_proj = None
+        self.cell_classifier = None
         if num_batches > 1 and batch_adv_weight > 0.0:
             self.batch_discriminator = BatchDiscriminator(lat_dim, num_batches).to(device)
         if context_dim > 0 and context_align_weight > 0.0:
@@ -143,6 +154,9 @@ class Trainer:
             self.all_params += list(self.batch_discriminator.parameters())
         if self.ctx_proj is not None:
             self.all_params += list(self.ctx_proj.parameters())
+        if num_cell_types > 1 and self.cell_type_loss_weight > 0.0:
+            self.cell_classifier = nn.Linear(lat_dim, num_cell_types).to(device)
+            self.all_params += list(self.cell_classifier.parameters())
         self.optim = torch.optim.Adam(self.all_params, lr=lr)
         self.scaler = torch.amp.GradScaler('cuda', enabled=torch.cuda.is_available())
         self.current_step = 0
@@ -165,6 +179,9 @@ class Trainer:
         print(f"Mask strategy: {self.mask_strategy}")
         print(f"Gene stats weight: {self.gene_stats_weight}, Zero-rate weight: {self.zero_rate_weight}")
         print(f"Gene stats anneal steps: {self.gene_stats_anneal_steps}, Zero-rate anneal steps: {self.zero_rate_anneal_steps}")
+        print(f"Disable KL: {self.disable_kl}")
+        print(f"Cell-type loss weight: {self.cell_type_loss_weight}, Dispersion weight: {self.dispersion_weight}")
+        print(f"Pi temperature: {self.pi_temperature}, Pi bias: {self.pi_bias}, Diffusion temperature: {self.diffusion_temperature}, Pi blend: {self.pi_blend}")
 
         num_warmup_steps_captured = warmup_steps
         num_training_steps_captured = total_steps
@@ -247,20 +264,30 @@ class Trainer:
                     print(f"Warning: NaN/Inf detected in encoder outputs (mu/logvar). Skipping batch.")
                     continue
                 
-                # Clamp logvar to prevent exploding std
-                logvar = torch.clamp(logvar, max=10)
+                if self.disable_kl:
+                    logvar = torch.zeros_like(mu)
+                    kl_div = torch.tensor(0.0, device=device)
+                    z = mu
+                else:
+                    # Clamp logvar to prevent exploding std
+                    logvar = torch.clamp(logvar, max=10)
 
-                # --- KL Divergence ---
-                kl_div_terms = 0.5 * (mu.pow(2) + logvar.exp() - 1.0 - logvar)
-                if self.kl_free_bits is not None and self.kl_free_bits > 0:
-                    kl_div_terms = torch.clamp(kl_div_terms, min=self.kl_free_bits)
-                # use per-dimension mean KL to avoid scale blow-up with large latent dims
-                kl_div = torch.mean(torch.relu(kl_div_terms), dim=-1).mean()
-                if torch.isnan(kl_div): kl_div = torch.tensor(0.0, device=device)
+                    # --- KL Divergence ---
+                    kl_div_terms = 0.5 * (mu.pow(2) + logvar.exp() - 1.0 - logvar)
+                    if self.kl_free_bits is not None and self.kl_free_bits > 0:
+                        kl_div_terms = torch.clamp(kl_div_terms, min=self.kl_free_bits)
+                    # use per-dimension mean KL to avoid scale blow-up with large latent dims
+                    kl_div = torch.mean(torch.relu(kl_div_terms), dim=-1).mean()
+                    if torch.isnan(kl_div): kl_div = torch.tensor(0.0, device=device)
 
-                std = torch.exp(0.5 * logvar)
-                eps = torch.randn_like(std)
-                z = mu + std * eps
+                    std = torch.exp(0.5 * logvar)
+                    eps = torch.randn_like(std)
+                    z = mu + std * eps
+                loss_cls = torch.tensor(0.0, device=device)
+                if self.cell_classifier is not None and cell_type_labels is not None:
+                    logits = self.cell_classifier(z)
+                    loss_cls = F.cross_entropy(logits, cell_type_labels)
+
                 t_indices = torch.randint(0, self.diff.N, (num_nodes_in_batch,), device=device).long()
                 time_values_for_loss = self.diff.timesteps[t_indices]
                 sigma_t_batch = self.diff.marginal_std(time_values_for_loss)
@@ -349,6 +376,7 @@ class Trainer:
                 # gene-wise mean/variance + zero-rate calibration (biologically grounded)
                 gene_stats_loss = torch.tensor(0.0, device=device)
                 zero_rate_loss = torch.tensor(0.0, device=device)
+                dispersion_loss = torch.tensor(0.0, device=device)
                 if (self.gene_stats_weight > 0.0 or self.zero_rate_weight > 0.0) and hasattr(self, 'gene_mean'):
                     target_mean = self.gene_mean.to(mu_rec.device)
                     target_var = self.gene_var.to(mu_rec.device) if hasattr(self, 'gene_var') and self.gene_var is not None else None
@@ -370,6 +398,12 @@ class Trainer:
                         zero_nb = torch.exp(theta_rec * (torch.log(theta_rec + 1e-6) - torch.log(theta_rec + mu_rec + 1e-6)))
                         exp_zero = pi_eff + (1.0 - pi_eff) * zero_nb
                         zero_rate_loss = F.mse_loss(exp_zero.mean(dim=0), target_zero)
+                    if self.dispersion_weight > 0.0 and target_var is not None:
+                        denom = (target_var - target_mean).clamp(min=1e-6)
+                        theta_target = (target_mean * target_mean / denom).clamp(min=1e-3, max=1e6)
+                        log_theta_target = torch.log(theta_target)
+                        log_theta_mean = log_theta_rec.mean(dim=0)
+                        dispersion_loss = F.mse_loss(log_theta_mean, log_theta_target)
 
                 # cross-modal alignment (context -> latent)
                 context_align_loss = torch.tensor(0.0, device=device)
@@ -383,7 +417,7 @@ class Trainer:
                     batch_logits = self.batch_discriminator(grad_reverse(mu, lambda_=1.0))
                     batch_adv_loss = F.cross_entropy(batch_logits, data.batch_id)
 
-                kl_weight = min(1.0, self.current_step / self.kl_anneal_steps) * self.loss_weights['kl']
+                kl_weight = 0.0 if self.disable_kl else (min(1.0, self.current_step / self.kl_anneal_steps) * self.loss_weights['kl'])
                 gene_stats_scale = min(1.0, float(self.current_step) / float(self.gene_stats_anneal_steps))
                 zero_rate_scale = min(1.0, float(self.current_step) / float(self.zero_rate_anneal_steps))
                 final_loss = (self.loss_weights['diff'] * loss_diff + 
@@ -392,7 +426,9 @@ class Trainer:
                               self.mask_rec_weight * loss_mask +
                               self.spectral_loss_weight * spectral_loss +
                               gene_stats_scale * self.gene_stats_weight * gene_stats_loss +
+                              gene_stats_scale * self.dispersion_weight * dispersion_loss +
                               zero_rate_scale * self.zero_rate_weight * zero_rate_loss +
+                              self.cell_type_loss_weight * loss_cls +
                               self.context_align_weight * context_align_loss +
                               self.batch_adv_weight * batch_adv_loss +
                               0.1 * loss_libsize)
@@ -472,7 +508,12 @@ class Trainer:
 
         z_gen_shape = (num_samples, self.diff.score_model.lat_dim)
         # sample_guided internally uses torch.enable_grad() if needed for guidance
-        z_generated = self.diff.sample(z_gen_shape, cell_type_labels=gen_cell_type_labels_tensor, context_embedding=context_embedding)
+        z_generated = self.diff.sample(
+            z_gen_shape,
+            cell_type_labels=gen_cell_type_labels_tensor,
+            context_embedding=context_embedding,
+            temperature=self.diffusion_temperature,
+        )
         
         # decoder now returns log_mu and log_theta
         log_mu_gen, log_theta_gen, logit_pi_gen, log_libsize_pred = self.decoder(z_generated)
@@ -485,8 +526,14 @@ class Trainer:
         theta_gen = torch.clamp(theta_gen, min=1e-6, max=1e6)
 
         # library size scaling (prefer training distribution if available)
-        if log_libsize_pred is not None:
+        libsize_target = None
+        if hasattr(self, 'libsize_values') and self.libsize_values is not None and self.libsize_values.numel() > 0:
+            lib_vals = self.libsize_values.to(mu_gen.device)
+            idx = torch.randint(0, lib_vals.numel(), (num_samples,), device=mu_gen.device)
+            libsize_target = lib_vals[idx].unsqueeze(1)
+        elif log_libsize_pred is not None:
             libsize_target = torch.exp(log_libsize_pred).clamp(min=1.0)
+        if libsize_target is not None:
             mu_sum = mu_gen.sum(dim=1, keepdim=True).clamp(min=1.0)
             mu_gen = mu_gen * (libsize_target / mu_sum)
 
@@ -498,7 +545,11 @@ class Trainer:
             if logit_pi_gen is None:
                 generated_counts_tensor = nb_dist.sample().to(torch.int32).float()
             else:
-                pi = torch.sigmoid(logit_pi_gen)
+                pi = torch.sigmoid((logit_pi_gen + self.pi_bias) / max(self.pi_temperature, 1e-6))
+                if hasattr(self, 'zero_rate') and self.zero_rate is not None and hasattr(self, 'pi_blend'):
+                    target_zero = self.zero_rate.to(pi.device).unsqueeze(0)
+                    pi = self.pi_blend * pi + (1.0 - self.pi_blend) * target_zero
+                pi = torch.clamp(pi, min=1e-4, max=1.0 - 1e-4)
                 nb_sample = nb_dist.sample()
                 zero_mask = (torch.rand_like(pi) < pi)
                 nb_sample = nb_sample.masked_fill(zero_mask, 0)
@@ -1012,6 +1063,12 @@ if __name__ == '__main__':
     parser.add_argument('--mask_strategy', type=str, default="high_var", choices=["random", "high_var"])
     parser.add_argument('--gene_stats_weight', type=float, default=1.0)
     parser.add_argument('--zero_rate_weight', type=float, default=1.0)
+    parser.add_argument('--cell_type_loss_weight', type=float, default=0.0)
+    parser.add_argument('--dispersion_weight', type=float, default=0.0)
+    parser.add_argument('--pi_temperature', type=float, default=1.0)
+    parser.add_argument('--pi_bias', type=float, default=0.0)
+    parser.add_argument('--pi_blend', type=float, default=0.8)
+    parser.add_argument('--diffusion_temperature', type=float, default=1.0)
     parser.add_argument('--gene_stats_anneal_steps', type=int, default=2000)
     parser.add_argument('--zero_rate_anneal_steps', type=int, default=2000)
     parser.add_argument('--early_stop_gene_stats', action='store_true', default=False)
@@ -1019,6 +1076,7 @@ if __name__ == '__main__':
     parser.add_argument('--early_stop_min_delta', type=float, default=1e-4)
     parser.add_argument('--kl_anneal_steps', type=int, default=1000)
     parser.add_argument('--kl_free_bits', type=float, default=0.1)
+    parser.add_argument('--disable_kl', action='store_true', default=False)
     parser.add_argument('--encoder_type', type=str, default="gnn", choices=["gnn", "mlp"])
     parser.add_argument('--use_scgen_context', action='store_true', default=False)
     parser.add_argument('--scgen_hf_repo', type=str, default="")
@@ -1052,6 +1110,12 @@ if __name__ == '__main__':
     MASK_STRATEGY = args.mask_strategy
     GENE_STATS_WEIGHT = args.gene_stats_weight
     ZERO_RATE_WEIGHT = args.zero_rate_weight
+    CELL_TYPE_LOSS_WEIGHT = args.cell_type_loss_weight
+    DISPERSION_WEIGHT = args.dispersion_weight
+    PI_TEMPERATURE = args.pi_temperature
+    PI_BIAS = args.pi_bias
+    PI_BLEND = args.pi_blend
+    DIFFUSION_TEMPERATURE = args.diffusion_temperature
     GENE_STATS_ANNEAL = args.gene_stats_anneal_steps
     ZERO_RATE_ANNEAL = args.zero_rate_anneal_steps
     EARLY_STOP_GENE_STATS = args.early_stop_gene_stats
@@ -1059,6 +1123,7 @@ if __name__ == '__main__':
     EARLY_STOP_MIN_DELTA = args.early_stop_min_delta
     KL_ANNEAL_STEPS = args.kl_anneal_steps
     KL_FREE_BITS = args.kl_free_bits
+    DISABLE_KL = args.disable_kl
     ENCODER_TYPE = args.encoder_type
     USE_SCGEN_CONTEXT = args.use_scgen_context
     SCGEN_HF_REPO = args.scgen_hf_repo
@@ -1287,7 +1352,10 @@ if __name__ == '__main__':
                         mask_rec_weight=MASK_REC_WEIGHT, kl_anneal_steps=KL_ANNEAL_STEPS, kl_free_bits=KL_FREE_BITS,
                         encoder_type=ENCODER_TYPE, batch_adv_weight=BATCH_ADV_WEIGHT, num_batches=num_batches,
                         context_align_weight=CONTEXT_ALIGN_WEIGHT, mask_strategy=MASK_STRATEGY, mask_gene_probs=mask_gene_probs,
-                        gene_stats_weight=GENE_STATS_WEIGHT, zero_rate_weight=ZERO_RATE_WEIGHT,
+                        gene_stats_weight=GENE_STATS_WEIGHT, zero_rate_weight=ZERO_RATE_WEIGHT, disable_kl=DISABLE_KL,
+                        cell_type_loss_weight=CELL_TYPE_LOSS_WEIGHT, dispersion_weight=DISPERSION_WEIGHT,
+                        pi_temperature=PI_TEMPERATURE, pi_bias=PI_BIAS, diffusion_temperature=DIFFUSION_TEMPERATURE,
+                        pi_blend=PI_BLEND,
                         gene_stats_anneal_steps=GENE_STATS_ANNEAL, zero_rate_anneal_steps=ZERO_RATE_ANNEAL)
         if USE_SCGEN_CONTEXT and scgen_context_stats is not None:
             trainer.scgen_context_stats = scgen_context_stats
@@ -1301,7 +1369,7 @@ if __name__ == '__main__':
             if hasattr(data0, 'x') and data0.x is not None and data0.x.numel() > 0:
                 x0f = data0.x.float()
                 trainer.zero_rate = (x0f == 0).float().mean(dim=0).cpu()
-                trainer.pi_blend = 0.8
+                trainer.pi_blend = 0.1
                 trainer.gene_mean = x0f.mean(dim=0).cpu()
                 trainer.gene_var = x0f.var(dim=0, unbiased=False).cpu()
                 trainer.libsize_values = x0f.sum(dim=1).cpu().clamp(min=1.0)
