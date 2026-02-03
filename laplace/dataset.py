@@ -85,6 +85,13 @@ class LaplaceDataset(InMemoryDataset):
             if os.path.exists(self.processed_paths[0]): os.remove(self.processed_paths[0])
             if os.path.exists(metadata_path): os.remove(metadata_path)
             self.process() # Re-process on loading error
+            # Retry load after re-process
+            if os.path.exists(self.processed_paths[0]):
+                data, slices = torch.load(self.processed_paths[0], weights_only=False)
+                self._data = data
+                self.slices = slices
+            else:
+                raise RuntimeError(f"Re-process failed to create {self.processed_paths[0]}")
 
     @property
     def raw_file_names(self):

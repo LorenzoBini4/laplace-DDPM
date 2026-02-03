@@ -109,9 +109,11 @@ def _experiment_plot_dir(args, label):
     cfg = dict(vars(args))
     cfg["label"] = label
     encoder_tag = str(cfg.get("encoder_type", "encoder")).lower()
+    plot_tag = str(cfg.get("plot_tag", "")).strip()
     cfg_json = json.dumps(cfg, sort_keys=True, default=str)
     digest = hashlib.sha1(cfg_json.encode("utf-8")).hexdigest()[:10]
-    out_dir = os.path.join(base_dir, f"{label}_{encoder_tag}_{ts}_{digest}")
+    tag_part = f"_{plot_tag}" if plot_tag else ""
+    out_dir = os.path.join(base_dir, f"{label}_{encoder_tag}{tag_part}_{ts}_{digest}")
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "config.json"), "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, sort_keys=True, default=str)
@@ -1294,6 +1296,7 @@ if __name__ == '__main__':
     parser.add_argument('--use_pseudo_labels', action='store_true', default=False)
     parser.add_argument('--stage2_start_epoch', type=int, default=0)
     parser.add_argument('--stage2_freeze_decoder', action='store_true', default=False)
+    parser.add_argument('--plot_tag', type=str, default="")
     args = parser.parse_args()
 
     BATCH_SIZE = args.batch_size
