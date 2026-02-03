@@ -14,10 +14,12 @@ from .utils import compute_lap_pe
 import torch_geometric
 from torch_geometric.data import download_url, extract_zip
 import warnings
+from collections.abc import Mapping
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')   
 class LaplaceDataset(InMemoryDataset):
-    def __init__(self, h5ad_path, k_neighbors=15, pe_dim=10, root='data/laplace', train=True, gene_threshold=20, pca_neighbors=50, seed=42, dataset_name='laplace'):
+    def __init__(self, h5ad_path, k_neighbors=15, pe_dim=10, root='data/laplace', train=True, gene_threshold=20, pca_neighbors=50, seed=42, dataset_name='laplace', force_reprocess=False, use_pseudo_labels=False,
+                 cell_type_path=None, cell_type_col="cell_type", barcode_col="barcode", cell_type_unknown="Unknown"):
         self.h5ad_path = h5ad_path
         self.k_neighbors = k_neighbors
         self.pe_dim = pe_dim
@@ -25,6 +27,12 @@ class LaplaceDataset(InMemoryDataset):
         self.gene_threshold = gene_threshold
         self.pca_neighbors = pca_neighbors
         self.seed = seed
+        self.force_reprocess = force_reprocess
+        self.use_pseudo_labels = use_pseudo_labels
+        self.cell_type_path = cell_type_path
+        self.cell_type_col = cell_type_col
+        self.barcode_col = barcode_col
+        self.cell_type_unknown = cell_type_unknown
         self.filtered_gene_names = []
         self.cell_type_categories = ["Unknown"] # Default
         self.num_cell_types = 1 # Default
@@ -35,6 +43,11 @@ class LaplaceDataset(InMemoryDataset):
 
         # Ensure processed data and metadata exist or process them
         metadata_path = self.processed_paths[0].replace(".pt", "_metadata.pt")
+        if self.force_reprocess:
+            if os.path.exists(self.processed_paths[0]):
+                os.remove(self.processed_paths[0])
+            if os.path.exists(metadata_path):
+                os.remove(metadata_path)
         if not os.path.exists(self.processed_paths[0]) or not os.path.exists(metadata_path):
             print(f"Processed file or metadata not found. Dataset will be processed.")
             if os.path.exists(self.processed_paths[0]): os.remove(self.processed_paths[0]) # Clean up if one exists but not other
@@ -181,6 +194,10 @@ class LaplaceDataset(InMemoryDataset):
             else:
                 # Standard H5AD (GEX only usually)
                 adata = sc.read_h5ad(self.h5ad_path)
+                try:
+                    adata.var_names_make_unique()
+                except Exception:
+                    pass
                 
                 # --- TRAIN/TEST SPLIT ---
                 n_total = adata.shape[0]
@@ -208,9 +225,92 @@ class LaplaceDataset(InMemoryDataset):
         except Exception as e:
             print(f"FATAL ERROR reading file {self.h5ad_path}: {e}"); traceback.print_exc(); raise
 
-        counts = adata.X
+        def _load_cell_type_labels(a):
+            if not self.cell_type_path:
+                return
+            if not os.path.exists(self.cell_type_path):
+                print(f"Warning: cell_type_path not found: {self.cell_type_path}. Using existing labels/Unknown.")
+                return
+            try:
+                df = pd.read_csv(self.cell_type_path, sep=None, engine="python")
+            except Exception as e:
+                print(f"Warning: failed to read cell_type_path {self.cell_type_path}: {e}. Skipping.")
+                return
+            if self.barcode_col in df.columns and self.cell_type_col in df.columns:
+                mapping = dict(zip(df[self.barcode_col].astype(str), df[self.cell_type_col].astype(str)))
+            elif df.shape[1] >= 2:
+                mapping = dict(zip(df.iloc[:, 0].astype(str), df.iloc[:, 1].astype(str)))
+            else:
+                print(f"Warning: cell_type_path {self.cell_type_path} has insufficient columns.")
+                return
+            obs_names = a.obs_names.astype(str)
+            labels = [mapping.get(bc, self.cell_type_unknown) for bc in obs_names]
+            a.obs["cell_type"] = pd.Categorical(labels)
+            missing = sum(1 for bc in obs_names if bc not in mapping)
+            if missing > 0:
+                print(f"Warning: {missing}/{len(obs_names)} barcodes missing in cell_type_path. Filled with {self.cell_type_unknown}.")
+
+        def _is_integerish(x):
+            if sp.issparse(x):
+                if x.data.size == 0:
+                    return True
+                if np.any(x.data < 0):
+                    return False
+                frac = np.max(np.abs(x.data - np.rint(x.data)))
+                return frac <= 1e-3
+            x = np.asarray(x)
+            if x.size == 0:
+                return True
+            if np.any(x < 0):
+                return False
+            frac = np.max(np.abs(x - np.rint(x)))
+            return frac <= 1e-3
+
+        def _resolve_counts_and_varnames(a):
+            if isinstance(getattr(a, "layers", None), Mapping) and "counts" in a.layers:
+                return a.layers["counts"], a.var_names, "layers['counts']"
+            if getattr(a, "raw", None) is not None and getattr(a.raw, "X", None) is not None:
+                return a.raw.X, a.raw.var_names, "raw.X"
+            return a.X, a.var_names, "X"
+
+        def _coerce_counts(x):
+            if sp.issparse(x):
+                if x.data.size == 0:
+                    return x
+                if np.any(x.data < 0):
+                    print("Warning: Negative values found in counts; clipping to 0.")
+                    x.data = np.clip(x.data, 0, None)
+                frac = np.max(np.abs(x.data - np.rint(x.data)))
+                if frac > 1e-3:
+                    print("Warning: Non-integer counts detected; rounding to nearest integer.")
+                    x.data = np.rint(x.data)
+                return x
+            x = np.asarray(x)
+            if np.any(x < 0):
+                print("Warning: Negative values found in counts; clipping to 0.")
+                x = np.clip(x, 0, None)
+            frac = np.max(np.abs(x - np.rint(x))) if x.size else 0.0
+            if frac > 1e-3:
+                print("Warning: Non-integer counts detected; rounding to nearest integer.")
+                x = np.rint(x)
+            return x
+
+        _load_cell_type_labels(adata)
+        counts, var_names, counts_source = _resolve_counts_and_varnames(adata)
+        if counts_source == "X":
+            if _is_integerish(adata.X):
+                if isinstance(getattr(adata, "layers", None), Mapping):
+                    adata.layers["counts"] = adata.X.copy() if not sp.issparse(adata.X) else adata.X.copy()
+                else:
+                    adata.layers = {"counts": adata.X.copy() if not sp.issparse(adata.X) else adata.X.copy()}
+                counts, var_names, counts_source = _resolve_counts_and_varnames(adata)
+                print("Warning: No counts layer/raw found. Inferred counts from X and stored in layers['counts'].")
+            else:
+                raise ValueError("Counts not found in layers['counts'] or raw.X, and adata.X is non-integer/non-counts. Please provide raw counts.")
+        counts = _coerce_counts(counts)
         num_cells, initial_num_genes = counts.shape
         print(f"Initial GEX data shape: {num_cells} cells, {initial_num_genes} genes.")
+        print(f"Using counts from: {counts_source}")
 
         if num_cells == 0 or initial_num_genes == 0:
              print("Warning: Input data is empty. Creating empty Data object.")
@@ -221,13 +321,15 @@ class LaplaceDataset(InMemoryDataset):
             genes_expressed_count = np.asarray((counts > 0).sum(axis=0)).flatten()
             genes_to_keep_mask = genes_expressed_count >= self.gene_threshold
             counts = counts[:, genes_to_keep_mask]
-            self.filtered_gene_names = adata.var_names[genes_to_keep_mask].tolist()
+            self.filtered_gene_names = np.array(var_names)[genes_to_keep_mask].tolist()
         else:
             genes_expressed_count = np.count_nonzero(counts, axis=0)
             genes_to_keep_mask = genes_expressed_count >= self.gene_threshold
             counts = counts[:, genes_to_keep_mask]
-            if hasattr(adata, 'var_names'): self.filtered_gene_names = [adata.var_names[i] for i, k in enumerate(genes_to_keep_mask) if k]
-            else: self.filtered_gene_names = [f'gene_{i}' for i in np.where(genes_to_keep_mask)[0]]
+            if var_names is not None:
+                self.filtered_gene_names = [var_names[i] for i, k in enumerate(genes_to_keep_mask) if k]
+            else:
+                self.filtered_gene_names = [f'gene_{i}' for i in np.where(genes_to_keep_mask)[0]]
 
         num_genes_after_filtering = counts.shape[1]
         print(f"Number of genes after filtering: {num_genes_after_filtering}")
@@ -248,25 +350,31 @@ class LaplaceDataset(InMemoryDataset):
                  chromatin_emb = None
 
         if 'cell_type' not in adata.obs.columns:
-             print("Warning: 'cell_type' not found in adata.obs.columns. Deriving pseudo-labels with Leiden.")
-             cell_type_labels = np.zeros(num_cells, dtype=int)
-             num_cell_types = 1
-             cell_type_categories = ["Unknown"]
-             try:
-                 adata_tmp = sc.AnnData(X=counts)
-                 with warnings.catch_warnings():
-                     warnings.filterwarnings("ignore", message="Some cells have zero counts", category=UserWarning)
-                     sc.pp.normalize_total(adata_tmp, target_sum=1e4)
-                 sc.pp.log1p(adata_tmp)
-                 sc.pp.pca(adata_tmp, n_comps=min(50, adata_tmp.shape[1] - 1))
-                 sc.pp.neighbors(adata_tmp, n_neighbors=min(15, adata_tmp.shape[0] - 1))
-                 sc.tl.leiden(adata_tmp, resolution=1.0)
-                 cell_type_series = adata_tmp.obs['leiden'].astype('category')
-                 cell_type_labels = cell_type_series.cat.codes.values
-                 num_cell_types = len(cell_type_series.cat.categories)
-                 cell_type_categories = cell_type_series.cat.categories.tolist()
-             except Exception as e:
-                 print(f"Warning: Leiden pseudo-labeling failed: {e}. Using Unknown label.")
+             if self.use_pseudo_labels:
+                 print("Warning: 'cell_type' not found in adata.obs.columns. Deriving pseudo-labels with Leiden.")
+                 cell_type_labels = np.zeros(num_cells, dtype=int)
+                 num_cell_types = 1
+                 cell_type_categories = ["Unknown"]
+                 try:
+                     adata_tmp = sc.AnnData(X=counts)
+                     with warnings.catch_warnings():
+                         warnings.filterwarnings("ignore", message="Some cells have zero counts", category=UserWarning)
+                         sc.pp.normalize_total(adata_tmp, target_sum=1e4)
+                     sc.pp.log1p(adata_tmp)
+                     sc.pp.pca(adata_tmp, n_comps=min(50, adata_tmp.shape[1] - 1))
+                     sc.pp.neighbors(adata_tmp, n_neighbors=min(15, adata_tmp.shape[0] - 1))
+                     sc.tl.leiden(adata_tmp, resolution=1.0)
+                     cell_type_series = adata_tmp.obs['leiden'].astype('category')
+                     cell_type_labels = cell_type_series.cat.codes.values
+                     num_cell_types = len(cell_type_series.cat.categories)
+                     cell_type_categories = cell_type_series.cat.categories.tolist()
+                 except Exception as e:
+                     print(f"Warning: Leiden pseudo-labeling failed: {e}. Using Unknown label.")
+             else:
+                 print("Warning: 'cell_type' not found in adata.obs.columns. Using single Unknown label.")
+                 cell_type_labels = np.zeros(num_cells, dtype=int)
+                 num_cell_types = 1
+                 cell_type_categories = ["Unknown"]
         else:
             cell_type_series = adata.obs['cell_type']
             if not pd.api.types.is_categorical_dtype(cell_type_series):
@@ -410,6 +518,7 @@ class LaplaceDataset(InMemoryDataset):
                 'filtered_gene_names': self.filtered_gene_names,
                 'cell_type_categories': self.cell_type_categories,
                 'num_cell_types': self.num_cell_types,
+                'counts_source': counts_source,
                 'context_dim': chromatin_emb.size(1), # Save context dim
                 'log_libsize_mean': log_libsize_mean,
                 'log_libsize_std': log_libsize_std

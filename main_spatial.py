@@ -8,6 +8,9 @@ from sklearn.neighbors import NearestNeighbors
 import scipy.sparse as sp
 from scipy.sparse.linalg import eigsh
 import os
+import json
+import hashlib
+from datetime import datetime
 import traceback
 import glob
 import scanpy as sc
@@ -100,6 +103,20 @@ def rbf_mmd_gpu(X, Y, scales=[0.1, 1.0, 10.0]):
         
     return results
 
+def _experiment_plot_dir(args, label):
+    base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qualitative_evaluation_plots_v2")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    cfg = dict(vars(args))
+    cfg["label"] = label
+    encoder_tag = str(cfg.get("encoder_type", "encoder")).lower()
+    cfg_json = json.dumps(cfg, sort_keys=True, default=str)
+    digest = hashlib.sha1(cfg_json.encode("utf-8")).hexdigest()[:10]
+    out_dir = os.path.join(base_dir, f"{label}_{encoder_tag}_{ts}_{digest}")
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, "config.json"), "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2, sort_keys=True, default=str)
+    return out_dir
+
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 class Trainer:
@@ -109,15 +126,28 @@ class Trainer:
                  kl_anneal_steps=1000, kl_free_bits=0.1, encoder_type="gnn",
                  batch_adv_weight=0.0, num_batches=1, context_align_weight=0.0,
                  mask_strategy="random", mask_gene_probs=None,
-                 gene_stats_weight=0.0, zero_rate_weight=0.0,
+                 gene_stats_weight=0.0, zero_rate_weight=0.0, cell_zero_rate_weight=0.0,
                  gene_stats_anneal_steps=1000, zero_rate_anneal_steps=1000,
                  disable_kl=False,
                  cell_type_loss_weight=0.0, dispersion_weight=0.0,
-                 pi_temperature=1.0, pi_bias=0.0, pi_blend=0.8, diffusion_temperature=1.0): # Added context_dim
+                 pi_temperature=1.0, pi_bias=0.0, pi_blend=0.8, diffusion_temperature=1.0,
+                 libsize_weight=0.1,
+                 gen_calibrate_means=False, gen_calibrate_zero=False,
+                 gen_match_zero_per_cell=False, gen_zero_per_cell_strength=1.0,
+                 gen_mean_scale_clip_low=0.25, gen_mean_scale_clip_high=4.0,
+                 diffusion_method="sde", simple_mode=False,
+                 transformer_layers=2, transformer_heads=8, transformer_dropout=0.1,
+                 bio_positional=False, bio_pos_dim=32): # Added context_dim
         print("\nInitializing Trainer...")
         self.encoder_type = encoder_type
         if encoder_type == "mlp":
             self.encoder = MLPEncoder(in_dim, hid_dim, lat_dim, pe_dim=pe_dim).to(device)
+            self.dual_graph = False
+        elif encoder_type == "transformer":
+            self.encoder = GlobalTransformerEncoder(
+                in_dim, hid_dim, lat_dim, pe_dim=pe_dim,
+                num_layers=transformer_layers, num_heads=transformer_heads, dropout=transformer_dropout
+            ).to(device)
             self.dual_graph = False
         else:
             self.encoder = SpectralEncoder(in_dim, hid_dim, lat_dim, pe_dim=pe_dim, dual_graph=dual_graph).to(device)
@@ -133,6 +163,7 @@ class Trainer:
         self.mask_gene_probs = mask_gene_probs
         self.gene_stats_weight = gene_stats_weight
         self.zero_rate_weight = zero_rate_weight
+        self.cell_zero_rate_weight = cell_zero_rate_weight
         self.gene_stats_anneal_steps = max(1, int(gene_stats_anneal_steps))
         self.zero_rate_anneal_steps = max(1, int(zero_rate_anneal_steps))
         self.disable_kl = disable_kl
@@ -142,9 +173,28 @@ class Trainer:
         self.pi_bias = pi_bias
         self.pi_blend = pi_blend
         self.diffusion_temperature = diffusion_temperature
+        self.libsize_weight = libsize_weight
+        self.gen_calibrate_means = gen_calibrate_means
+        self.gen_calibrate_zero = gen_calibrate_zero
+        self.gen_match_zero_per_cell = gen_match_zero_per_cell
+        self.gen_zero_per_cell_strength = gen_zero_per_cell_strength
+        self.gen_mean_scale_clip_low = gen_mean_scale_clip_low
+        self.gen_mean_scale_clip_high = gen_mean_scale_clip_high
+        self.diffusion_method = diffusion_method
+        self.simple_mode = simple_mode
+        self.bio_positional = bio_positional
+        self.bio_pos_dim = bio_pos_dim
         self.batch_discriminator = None
         self.ctx_proj = None
         self.cell_classifier = None
+
+        if self.simple_mode:
+            self.input_masking_fraction = 0.0
+            self.mask_rec_weight = 0.0
+            self.spectral_loss_weight = 0.0
+            self.batch_adv_weight = 0.0
+            self.context_align_weight = 0.0
+            self.dispersion_weight = 0.0
         if num_batches > 1 and batch_adv_weight > 0.0:
             self.batch_discriminator = BatchDiscriminator(lat_dim, num_batches).to(device)
         if context_dim > 0 and context_align_weight > 0.0:
@@ -169,6 +219,7 @@ class Trainer:
 
         if loss_weights is None: self.loss_weights = {'diff': 1.0, 'kl': 0.01, 'rec': 1.0} 
         else: self.loss_weights = loss_weights
+        self.base_loss_weights = dict(self.loss_weights)
         print(f"Using loss weights: {self.loss_weights}")
         print(f"Input masking fraction: {self.input_masking_fraction}")
         print(f"Multimodal Context Dim: {self.context_dim}")
@@ -178,20 +229,30 @@ class Trainer:
         print(f"Batch adv weight: {self.batch_adv_weight}, Context align weight: {self.context_align_weight}")
         print(f"Mask strategy: {self.mask_strategy}")
         print(f"Gene stats weight: {self.gene_stats_weight}, Zero-rate weight: {self.zero_rate_weight}")
+        print(f"Cell zero-rate weight: {self.cell_zero_rate_weight}")
         print(f"Gene stats anneal steps: {self.gene_stats_anneal_steps}, Zero-rate anneal steps: {self.zero_rate_anneal_steps}")
         print(f"Disable KL: {self.disable_kl}")
         print(f"Cell-type loss weight: {self.cell_type_loss_weight}, Dispersion weight: {self.dispersion_weight}")
+        print(f"Libsize weight: {self.libsize_weight}")
         print(f"Pi temperature: {self.pi_temperature}, Pi bias: {self.pi_bias}, Diffusion temperature: {self.diffusion_temperature}, Pi blend: {self.pi_blend}")
+        print(f"Gen calibrate means: {self.gen_calibrate_means}, Gen calibrate zero: {self.gen_calibrate_zero}")
+        print(f"Gen match zero per cell: {self.gen_match_zero_per_cell}, Strength: {self.gen_zero_per_cell_strength}")
+        print(f"Gen mean scale clip: [{self.gen_mean_scale_clip_low}, {self.gen_mean_scale_clip_high}]")
+        print(f"Diffusion method: {self.diffusion_method}, Simple mode: {self.simple_mode}")
+        print(f"Bio positional: {self.bio_positional}, Bio pos dim: {self.bio_pos_dim}")
+        print(f"Transformer layers: {transformer_layers}, heads: {transformer_heads}, dropout: {transformer_dropout}")
 
-        num_warmup_steps_captured = warmup_steps
-        num_training_steps_captured = total_steps
+        num_warmup_steps_captured = int(warmup_steps)
+        num_training_steps_captured = int(total_steps)
         def lr_lambda_fn(current_scheduler_step):
-            if num_training_steps_captured == 0: return 1.0
-            actual_warmup_steps = min(num_warmup_steps_captured, num_training_steps_captured)
+            if num_training_steps_captured <= 0:
+                return 1.0
+            actual_warmup_steps = min(num_warmup_steps_captured, max(1, num_training_steps_captured))
             if current_scheduler_step < actual_warmup_steps:
                 return float(current_scheduler_step + 1) / float(max(1, actual_warmup_steps))
             decay_phase_duration = num_training_steps_captured - actual_warmup_steps
-            if decay_phase_duration <= 0: return 0.0
+            if decay_phase_duration <= 0:
+                return 0.0
             current_step_in_decay = current_scheduler_step - actual_warmup_steps
             progress = float(current_step_in_decay) / float(max(1, decay_phase_duration))
             progress = min(1.0, progress)
@@ -199,11 +260,52 @@ class Trainer:
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optim, lr_lambda_fn)
         print("Trainer initialized.")
 
+    def set_stage(self, stage, freeze_decoder=False):
+        if stage == 1:
+            self.loss_weights['diff'] = 0.0
+            self.denoiser.requires_grad_(False)
+            self.decoder.requires_grad_(True)
+            print("Stage 1: diffusion loss off; denoiser frozen.")
+        else:
+            self.loss_weights['diff'] = self.base_loss_weights.get('diff', 1.0)
+            self.denoiser.requires_grad_(True)
+            self.decoder.requires_grad_(not freeze_decoder)
+            msg = "Stage 2: diffusion loss on; denoiser unfrozen."
+            if freeze_decoder:
+                msg += " Decoder frozen."
+            print(msg)
+
+    def _bio_pos_enc(self, pos, dim):
+        if pos is None or pos.numel() == 0:
+            return None
+        pos = pos.float()
+        if pos.ndim != 2 or pos.size(1) == 0:
+            return None
+        # Normalize spatial coords
+        pos = pos - pos.mean(dim=0, keepdim=True)
+        pos = pos / (pos.std(dim=0, keepdim=True).clamp(min=1e-6))
+        # Sinusoidal encoding
+        dim = int(dim)
+        if dim <= 0:
+            return None
+        n_freq = max(1, dim // (2 * pos.size(1)))
+        freqs = torch.logspace(0, 2, steps=n_freq, device=pos.device, dtype=pos.dtype)
+        enc = []
+        for i in range(pos.size(1)):
+            for f in freqs:
+                enc.append(torch.sin(pos[:, i] * f))
+                enc.append(torch.cos(pos[:, i] * f))
+        enc = torch.stack(enc, dim=1)
+        if enc.size(1) < dim:
+            pad = torch.zeros(pos.size(0), dim - enc.size(1), device=pos.device, dtype=pos.dtype)
+            enc = torch.cat([enc, pad], dim=1)
+        return enc[:, :dim]
+
     def train_epoch(self, loader, current_epoch_num): # Added current_epoch_num for logging
         self.encoder.train(); self.denoiser.train(); self.decoder.train()
         total_loss_val, total_loss_diff_val, total_loss_kl_val, total_loss_rec_val = 0.0, 0.0, 0.0, 0.0
         total_loss_mask_val, total_loss_spec_val = 0.0, 0.0
-        total_gene_stats_val, total_zero_rate_val = 0.0, 0.0
+        total_gene_stats_val, total_zero_rate_val, total_cell_zero_rate_val = 0.0, 0.0, 0.0
         num_batches_processed = 0
 
         # TQDM Wrapper
@@ -227,6 +329,10 @@ class Trainer:
                 masked_x[mask] = 0.0 # Set masked genes to zero
 
             lap_pe = data.lap_pe
+            if self.bio_positional and hasattr(data, 'pos') and data.pos is not None and data.pos.numel() > 0:
+                bio_pe = self._bio_pos_enc(data.pos, self.bio_pos_dim)
+                if bio_pe is not None:
+                    lap_pe = bio_pe
             if lap_pe is None or lap_pe.size(0) != num_nodes_in_batch or lap_pe.size(1) != self.encoder.pe_dim:
                 lap_pe = torch.zeros(num_nodes_in_batch, self.encoder.pe_dim, device=device, dtype=masked_x.dtype) # Use masked_x.dtype
 
@@ -288,24 +394,27 @@ class Trainer:
                     logits = self.cell_classifier(z)
                     loss_cls = F.cross_entropy(logits, cell_type_labels)
 
-                t_indices = torch.randint(0, self.diff.N, (num_nodes_in_batch,), device=device).long()
-                time_values_for_loss = self.diff.timesteps[t_indices]
-                sigma_t_batch = self.diff.marginal_std(time_values_for_loss)
-                if sigma_t_batch.ndim == 1: sigma_t_batch = sigma_t_batch.unsqueeze(-1)
-                
-                noise_target = torch.randn_like(mu)
-                alpha_t = torch.exp(-time_values_for_loss).unsqueeze(-1)
-                zt_corrupted = alpha_t * mu.detach() + sigma_t_batch * noise_target
-                
-                # Multimodal Conditioning
-                context_embedding = None
-                if hasattr(data, 'chromatin') and data.chromatin is not None and data.chromatin.size(1) > 0:
-                     if data.chromatin.size(1) == self.denoiser.context_dim:
-                         context_embedding = data.chromatin
-                
-                eps_predicted = self.denoiser(zt_corrupted, time_values_for_loss, cell_type_labels, context_embedding=context_embedding)
-                loss_diff = F.mse_loss(eps_predicted, noise_target)
-                if torch.isnan(loss_diff): loss_diff = torch.tensor(0.0, device=device)
+                # Diffusion loss (skip entirely if weight is zero)
+                loss_diff = torch.tensor(0.0, device=device)
+                if self.loss_weights.get('diff', 0.0) > 0.0:
+                    t_indices = torch.randint(0, self.diff.N, (num_nodes_in_batch,), device=device).long()
+                    time_values_for_loss = self.diff.timesteps[t_indices]
+                    sigma_t_batch = self.diff.marginal_std(time_values_for_loss)
+                    if sigma_t_batch.ndim == 1: sigma_t_batch = sigma_t_batch.unsqueeze(-1)
+                    
+                    noise_target = torch.randn_like(z)
+                    alpha_t = torch.exp(-time_values_for_loss).unsqueeze(-1)
+                    zt_corrupted = alpha_t * z.detach() + sigma_t_batch * noise_target
+                    
+                    # Multimodal Conditioning
+                    context_embedding = None
+                    if hasattr(data, 'chromatin') and data.chromatin is not None and data.chromatin.size(1) > 0:
+                         if data.chromatin.size(1) == self.denoiser.context_dim:
+                             context_embedding = data.chromatin
+                    
+                    eps_predicted = self.denoiser(zt_corrupted, time_values_for_loss, cell_type_labels, context_embedding=context_embedding)
+                    loss_diff = F.mse_loss(eps_predicted, noise_target)
+                    if torch.isnan(loss_diff): loss_diff = torch.tensor(0.0, device=device)
 
                 # --- Negative Binomial Reconstruction Loss ---
                 log_mu_rec, log_theta_rec, logit_pi_rec, log_libsize_pred = self.decoder(z)
@@ -376,28 +485,35 @@ class Trainer:
                 # gene-wise mean/variance + zero-rate calibration (biologically grounded)
                 gene_stats_loss = torch.tensor(0.0, device=device)
                 zero_rate_loss = torch.tensor(0.0, device=device)
+                cell_zero_rate_loss = torch.tensor(0.0, device=device)
                 dispersion_loss = torch.tensor(0.0, device=device)
-                if (self.gene_stats_weight > 0.0 or self.zero_rate_weight > 0.0) and hasattr(self, 'gene_mean'):
+                if (self.gene_stats_weight > 0.0 or self.zero_rate_weight > 0.0 or self.cell_zero_rate_weight > 0.0) and hasattr(self, 'gene_mean'):
                     target_mean = self.gene_mean.to(mu_rec.device)
                     target_var = self.gene_var.to(mu_rec.device) if hasattr(self, 'gene_var') and self.gene_var is not None else None
                     if logit_pi_rec is None:
                         pi_eff = torch.zeros_like(mu_rec)
                     else:
                         pi_eff = torch.sigmoid(logit_pi_rec)
-                    exp_mean = (1.0 - pi_eff) * mu_rec
+                    exp_mean_cell = (1.0 - pi_eff) * mu_rec
+                    exp_mean = exp_mean_cell.mean(dim=0)
                     if target_var is not None:
                         nb_var = mu_rec + (mu_rec ** 2) / (theta_rec + 1e-6)
-                        exp_var = (1.0 - pi_eff) * nb_var + pi_eff * (0.0 - exp_mean) ** 2
-                        mean_loss = F.mse_loss(torch.log1p(exp_mean.mean(dim=0)), torch.log1p(target_mean))
-                        var_loss = F.mse_loss(torch.log1p(exp_var.mean(dim=0)), torch.log1p(target_var))
+                        exp_var_cell = (1.0 - pi_eff) * nb_var + pi_eff * (0.0 - exp_mean_cell) ** 2
+                        exp_var = exp_var_cell.mean(dim=0) + exp_mean_cell.var(dim=0, unbiased=False)
+                        mean_loss = F.mse_loss(torch.log1p(exp_mean), torch.log1p(target_mean))
+                        var_loss = F.mse_loss(torch.log1p(exp_var), torch.log1p(target_var))
                         gene_stats_loss = mean_loss + var_loss
                     else:
-                        gene_stats_loss = F.mse_loss(torch.log1p(exp_mean.mean(dim=0)), torch.log1p(target_mean))
-                    if hasattr(self, 'zero_rate') and self.zero_rate is not None:
+                        gene_stats_loss = F.mse_loss(torch.log1p(exp_mean), torch.log1p(target_mean))
+                    zero_nb = torch.exp(theta_rec * (torch.log(theta_rec + 1e-6) - torch.log(theta_rec + mu_rec + 1e-6)))
+                    exp_zero = pi_eff + (1.0 - pi_eff) * zero_nb
+                    if hasattr(self, 'zero_rate') and self.zero_rate is not None and self.zero_rate_weight > 0.0:
                         target_zero = self.zero_rate.to(mu_rec.device)
-                        zero_nb = torch.exp(theta_rec * (torch.log(theta_rec + 1e-6) - torch.log(theta_rec + mu_rec + 1e-6)))
-                        exp_zero = pi_eff + (1.0 - pi_eff) * zero_nb
                         zero_rate_loss = F.mse_loss(exp_zero.mean(dim=0), target_zero)
+                    if self.cell_zero_rate_weight > 0.0:
+                        target_zero_cell = (target_counts == 0).float().mean(dim=1)
+                        exp_zero_cell = exp_zero.mean(dim=1)
+                        cell_zero_rate_loss = F.mse_loss(exp_zero_cell, target_zero_cell)
                     if self.dispersion_weight > 0.0 and target_var is not None:
                         denom = (target_var - target_mean).clamp(min=1e-6)
                         theta_target = (target_mean * target_mean / denom).clamp(min=1e-3, max=1e6)
@@ -428,10 +544,11 @@ class Trainer:
                               gene_stats_scale * self.gene_stats_weight * gene_stats_loss +
                               gene_stats_scale * self.dispersion_weight * dispersion_loss +
                               zero_rate_scale * self.zero_rate_weight * zero_rate_loss +
+                              zero_rate_scale * self.cell_zero_rate_weight * cell_zero_rate_loss +
                               self.cell_type_loss_weight * loss_cls +
                               self.context_align_weight * context_align_loss +
                               self.batch_adv_weight * batch_adv_loss +
-                              0.1 * loss_libsize)
+                              self.libsize_weight * loss_libsize)
 
             if torch.isnan(final_loss):
                  print(f"Warning: NaN loss detected at epoch {current_epoch_num}, step {self.current_step}. Skipping batch.")
@@ -457,6 +574,7 @@ class Trainer:
             total_loss_spec_val += spectral_loss.item()
             total_gene_stats_val += gene_stats_loss.item() if torch.is_tensor(gene_stats_loss) else float(gene_stats_loss)
             total_zero_rate_val += zero_rate_loss.item() if torch.is_tensor(zero_rate_loss) else float(zero_rate_loss)
+            total_cell_zero_rate_val += cell_zero_rate_loss.item() if torch.is_tensor(cell_zero_rate_loss) else float(cell_zero_rate_loss)
             num_batches_processed +=1
 
         if num_batches_processed > 0:
@@ -468,10 +586,11 @@ class Trainer:
             avg_spec_loss = total_loss_spec_val / num_batches_processed
             avg_gene_stats = total_gene_stats_val / num_batches_processed
             avg_zero_rate = total_zero_rate_val / num_batches_processed
-            return avg_total_loss, avg_diff_loss, avg_kl_loss, avg_rec_loss, avg_mask_loss, avg_spec_loss, avg_gene_stats, avg_zero_rate
+            avg_cell_zero_rate = total_cell_zero_rate_val / num_batches_processed
+            return avg_total_loss, avg_diff_loss, avg_kl_loss, avg_rec_loss, avg_mask_loss, avg_spec_loss, avg_gene_stats, avg_zero_rate, avg_cell_zero_rate
         else:
             print(f"Warning: No batches processed in epoch {current_epoch_num}.")
-            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
     def state_dict(self):
         return {
@@ -513,6 +632,7 @@ class Trainer:
             cell_type_labels=gen_cell_type_labels_tensor,
             context_embedding=context_embedding,
             temperature=self.diffusion_temperature,
+            method=self.diffusion_method,
         )
         
         # decoder now returns log_mu and log_theta
@@ -545,11 +665,32 @@ class Trainer:
             if logit_pi_gen is None:
                 generated_counts_tensor = nb_dist.sample().to(torch.int32).float()
             else:
-                pi = torch.sigmoid((logit_pi_gen + self.pi_bias) / max(self.pi_temperature, 1e-6))
-                if hasattr(self, 'zero_rate') and self.zero_rate is not None and hasattr(self, 'pi_blend'):
-                    target_zero = self.zero_rate.to(pi.device).unsqueeze(0)
-                    pi = self.pi_blend * pi + (1.0 - self.pi_blend) * target_zero
-                pi = torch.clamp(pi, min=1e-4, max=1.0 - 1e-4)
+                pi_raw = torch.sigmoid((logit_pi_gen + self.pi_bias) / max(self.pi_temperature, 1e-6))
+                if self.gen_calibrate_means and hasattr(self, 'gene_mean') and self.gene_mean is not None:
+                    exp_mean = (1.0 - pi_raw) * mu_gen
+                    target_mean = self.gene_mean.to(mu_gen.device).unsqueeze(0)
+                    current_mean = exp_mean.mean(dim=0, keepdim=True).clamp(min=1e-6)
+                    scale = (target_mean / current_mean).clamp(min=self.gen_mean_scale_clip_low, max=self.gen_mean_scale_clip_high)
+                    mu_gen = mu_gen * scale
+                    probs = mu_gen / (mu_gen + theta_gen + 1e-6)
+                    probs = torch.clamp(probs, min=1e-6, max=1-1e-6)
+                    nb_dist = dist.NegativeBinomial(total_count=theta_gen, probs=probs)
+                if self.gen_calibrate_zero and hasattr(self, 'zero_rate') and self.zero_rate is not None:
+                    target_zero = self.zero_rate.to(pi_raw.device).unsqueeze(0)
+                    nb_zero = torch.exp(theta_gen * (torch.log(theta_gen + 1e-6) - torch.log(theta_gen + mu_gen + 1e-6)))
+                    total_zero = target_zero
+                    pi = (total_zero - nb_zero) / (1.0 - nb_zero + 1e-6)
+                    pi = torch.clamp(pi, min=1e-6, max=1.0 - 1e-6)
+                elif hasattr(self, 'zero_rate') and self.zero_rate is not None and hasattr(self, 'pi_blend'):
+                    target_zero = self.zero_rate.to(pi_raw.device).unsqueeze(0)
+                    nb_zero = torch.exp(theta_gen * (torch.log(theta_gen + 1e-6) - torch.log(theta_gen + mu_gen + 1e-6)))
+                    total_zero = pi_raw + (1.0 - pi_raw) * nb_zero
+                    total_zero = torch.clamp(total_zero, min=1e-6, max=1.0 - 1e-6)
+                    total_zero = self.pi_blend * total_zero + (1.0 - self.pi_blend) * target_zero
+                    pi = (total_zero - nb_zero) / (1.0 - nb_zero + 1e-6)
+                    pi = torch.clamp(pi, min=1e-6, max=1.0 - 1e-6)
+                else:
+                    pi = pi_raw
                 nb_sample = nb_dist.sample()
                 zero_mask = (torch.rand_like(pi) < pi)
                 nb_sample = nb_sample.masked_fill(zero_mask, 0)
@@ -558,6 +699,45 @@ class Trainer:
         except Exception as e:
             print(f"Error during sampling from Negative Binomial: {e}. Returning zero counts."); traceback.print_exc()
             generated_counts_tensor = torch.zeros_like(mu_gen) # use mu_gen shape for consistency
+
+        if self.gen_match_zero_per_cell and hasattr(self, 'zero_per_cell_values') and self.zero_per_cell_values is not None:
+            zero_vals = self.zero_per_cell_values.to(generated_counts_tensor.device)
+            if zero_vals.numel() > 0:
+                idx = torch.randint(0, zero_vals.numel(), (generated_counts_tensor.size(0),), device=generated_counts_tensor.device)
+                target_zero_counts = zero_vals[idx]
+                counts = generated_counts_tensor
+                for i in range(counts.size(0)):
+                    cur_zero = int((counts[i] == 0).sum().item())
+                    tgt_zero = int(target_zero_counts[i].item())
+                    diff = cur_zero - tgt_zero
+                    if diff == 0:
+                        continue
+                    k = int(round(abs(diff) * float(self.gen_zero_per_cell_strength)))
+                    if k <= 0:
+                        continue
+                    if diff > 0:
+                        zero_idx = torch.nonzero(counts[i] == 0, as_tuple=False).squeeze(1)
+                        if zero_idx.numel() == 0:
+                            continue
+                        pick = zero_idx[torch.randperm(zero_idx.numel(), device=counts.device)[:min(k, zero_idx.numel())]]
+                        probs_i = mu_gen[i, pick] / (mu_gen[i, pick] + theta_gen[i, pick] + 1e-6)
+                        probs_i = torch.clamp(probs_i, min=1e-6, max=1-1e-6)
+                        nb_i = dist.NegativeBinomial(total_count=theta_gen[i, pick], probs=probs_i)
+                        new_vals = nb_i.sample()
+                        new_vals = torch.where(new_vals == 0, torch.ones_like(new_vals), new_vals)
+                        counts[i, pick] = new_vals
+                    else:
+                        nz_idx = torch.nonzero(counts[i] > 0, as_tuple=False).squeeze(1)
+                        if nz_idx.numel() == 0:
+                            continue
+                        vals = counts[i, nz_idx]
+                        if vals.numel() > k:
+                            _, order = torch.topk(vals, k, largest=False)
+                            pick = nz_idx[order]
+                        else:
+                            pick = nz_idx
+                        counts[i, pick] = 0
+                generated_counts_tensor = counts
 
         generated_counts_np = generated_counts_tensor.cpu().numpy()
         generated_cell_types_np = gen_cell_type_labels_tensor.cpu().numpy()
@@ -912,7 +1092,7 @@ class Trainer:
                 # Generate a batch of Z for this label
                 z_shape = (50, self.diff.score_model.lat_dim)
                 label_tensor = torch.full((50,), label, dtype=torch.long, device=device)
-                z_gen = self.diff.sample(z_shape, cell_type_labels=label_tensor) # This is the "Denoised Latent"
+                z_gen = self.diff.sample(z_shape, cell_type_labels=label_tensor, method=self.diffusion_method) # This is the "Denoised Latent"
                 z_centroids[label] = z_gen.mean(dim=0)
             
             # interpolate between pairs
@@ -1037,6 +1217,10 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--seed', type=int, default=77)
+    parser.add_argument('--cell_type_path', type=str, default="")
+    parser.add_argument('--cell_type_col', type=str, default="cell_type")
+    parser.add_argument('--barcode_col', type=str, default="barcode")
+    parser.add_argument('--cell_type_unknown', type=str, default="Unknown")
     parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--hidden_dim', type=int, default=512)
     parser.add_argument('--latent_dim', type=int, default=512)
@@ -1063,12 +1247,22 @@ if __name__ == '__main__':
     parser.add_argument('--mask_strategy', type=str, default="high_var", choices=["random", "high_var"])
     parser.add_argument('--gene_stats_weight', type=float, default=1.0)
     parser.add_argument('--zero_rate_weight', type=float, default=1.0)
+    parser.add_argument('--cell_zero_rate_weight', type=float, default=0.0)
     parser.add_argument('--cell_type_loss_weight', type=float, default=0.0)
     parser.add_argument('--dispersion_weight', type=float, default=0.0)
+    parser.add_argument('--libsize_weight', type=float, default=0.1)
     parser.add_argument('--pi_temperature', type=float, default=1.0)
     parser.add_argument('--pi_bias', type=float, default=0.0)
     parser.add_argument('--pi_blend', type=float, default=0.8)
     parser.add_argument('--diffusion_temperature', type=float, default=1.0)
+    parser.add_argument('--gen_calibrate_means', action='store_true', default=False)
+    parser.add_argument('--gen_calibrate_zero', action='store_true', default=False)
+    parser.add_argument('--gen_match_zero_per_cell', action='store_true', default=False)
+    parser.add_argument('--gen_zero_per_cell_strength', type=float, default=1.0)
+    parser.add_argument('--gen_mean_scale_clip_low', type=float, default=0.25)
+    parser.add_argument('--gen_mean_scale_clip_high', type=float, default=4.0)
+    parser.add_argument('--diffusion_method', type=str, default="sde", choices=["sde", "ddim"])
+    parser.add_argument('--simple_mode', action='store_true', default=False)
     parser.add_argument('--gene_stats_anneal_steps', type=int, default=2000)
     parser.add_argument('--zero_rate_anneal_steps', type=int, default=2000)
     parser.add_argument('--early_stop_gene_stats', action='store_true', default=False)
@@ -1077,16 +1271,29 @@ if __name__ == '__main__':
     parser.add_argument('--kl_anneal_steps', type=int, default=1000)
     parser.add_argument('--kl_free_bits', type=float, default=0.1)
     parser.add_argument('--disable_kl', action='store_true', default=False)
-    parser.add_argument('--encoder_type', type=str, default="gnn", choices=["gnn", "mlp"])
+    parser.add_argument('--encoder_type', type=str, default="gnn", choices=["gnn", "mlp", "transformer"])
+    parser.add_argument('--transformer_layers', type=int, default=2)
+    parser.add_argument('--transformer_heads', type=int, default=8)
+    parser.add_argument('--transformer_dropout', type=float, default=0.1)
+    parser.add_argument('--bio_positional', action='store_true', default=False)
+    parser.add_argument('--bio_pos_dim', type=int, default=32)
     parser.add_argument('--use_scgen_context', action='store_true', default=False)
     parser.add_argument('--scgen_hf_repo', type=str, default="")
     parser.add_argument('--scgen_local_dir', type=str, default="")
     parser.add_argument('--use_scvi_context', action='store_true', default=False)
     parser.add_argument('--scvi_hf_repo', type=str, default="")
     parser.add_argument('--scvi_local_dir', type=str, default="")
+    parser.add_argument('--scvi_train', action='store_true', default=False)
+    parser.add_argument('--scvi_train_dir', type=str, default="scvi_trained")
+    parser.add_argument('--scvi_train_epochs', type=int, default=200)
+    parser.add_argument('--scvi_train_batch_size', type=int, default=256)
     parser.add_argument('--dual_graph', action='store_true', default=True)
     parser.add_argument('--eval_only', action='store_true', default=False)
     parser.add_argument('--checkpoint_path', type=str, default="")
+    parser.add_argument('--force_reprocess', action='store_true', default=False)
+    parser.add_argument('--use_pseudo_labels', action='store_true', default=False)
+    parser.add_argument('--stage2_start_epoch', type=int, default=0)
+    parser.add_argument('--stage2_freeze_decoder', action='store_true', default=False)
     args = parser.parse_args()
 
     BATCH_SIZE = args.batch_size
@@ -1110,12 +1317,22 @@ if __name__ == '__main__':
     MASK_STRATEGY = args.mask_strategy
     GENE_STATS_WEIGHT = args.gene_stats_weight
     ZERO_RATE_WEIGHT = args.zero_rate_weight
+    CELL_ZERO_RATE_WEIGHT = args.cell_zero_rate_weight
     CELL_TYPE_LOSS_WEIGHT = args.cell_type_loss_weight
     DISPERSION_WEIGHT = args.dispersion_weight
+    LIBSIZE_WEIGHT = args.libsize_weight
     PI_TEMPERATURE = args.pi_temperature
     PI_BIAS = args.pi_bias
     PI_BLEND = args.pi_blend
     DIFFUSION_TEMPERATURE = args.diffusion_temperature
+    GEN_CALIBRATE_MEANS = args.gen_calibrate_means
+    GEN_CALIBRATE_ZERO = args.gen_calibrate_zero
+    GEN_MATCH_ZERO_PER_CELL = args.gen_match_zero_per_cell
+    GEN_ZERO_PER_CELL_STRENGTH = args.gen_zero_per_cell_strength
+    GEN_MEAN_SCALE_CLIP_LOW = args.gen_mean_scale_clip_low
+    GEN_MEAN_SCALE_CLIP_HIGH = args.gen_mean_scale_clip_high
+    DIFFUSION_METHOD = args.diffusion_method
+    SIMPLE_MODE = args.simple_mode
     GENE_STATS_ANNEAL = args.gene_stats_anneal_steps
     ZERO_RATE_ANNEAL = args.zero_rate_anneal_steps
     EARLY_STOP_GENE_STATS = args.early_stop_gene_stats
@@ -1125,15 +1342,32 @@ if __name__ == '__main__':
     KL_FREE_BITS = args.kl_free_bits
     DISABLE_KL = args.disable_kl
     ENCODER_TYPE = args.encoder_type
+    TRANSFORMER_LAYERS = args.transformer_layers
+    TRANSFORMER_HEADS = args.transformer_heads
+    TRANSFORMER_DROPOUT = args.transformer_dropout
+    BIO_POSITIONAL = args.bio_positional
+    BIO_POS_DIM = args.bio_pos_dim
     USE_SCGEN_CONTEXT = args.use_scgen_context
     SCGEN_HF_REPO = args.scgen_hf_repo
     SCGEN_LOCAL_DIR = args.scgen_local_dir
     USE_SCVI_CONTEXT = args.use_scvi_context
     SCVI_HF_REPO = args.scvi_hf_repo
     SCVI_LOCAL_DIR = args.scvi_local_dir
+    SCVI_TRAIN = args.scvi_train
+    SCVI_TRAIN_DIR = args.scvi_train_dir
+    SCVI_TRAIN_EPOCHS = args.scvi_train_epochs
+    SCVI_TRAIN_BATCH_SIZE = args.scvi_train_batch_size
     DUAL_GRAPH = args.dual_graph
     EVAL_ONLY = args.eval_only
     CHECKPOINT_PATH = args.checkpoint_path
+    FORCE_REPROCESS = args.force_reprocess
+    USE_PSEUDO_LABELS = args.use_pseudo_labels
+    CELL_TYPE_PATH = args.cell_type_path.strip() if isinstance(args.cell_type_path, str) else ""
+    CELL_TYPE_COL = args.cell_type_col
+    BARCODE_COL = args.barcode_col
+    CELL_TYPE_UNKNOWN = args.cell_type_unknown
+    STAGE2_START_EPOCH = args.stage2_start_epoch
+    STAGE2_FREEZE_DECODER = args.stage2_freeze_decoder
     
     set_seed(GLOBAL_SEED)
 
@@ -1155,7 +1389,13 @@ if __name__ == '__main__':
 
     try:
         print(f"Loading/Processing training data from: {TRAIN_H5AD}")
-        train_dataset = LaplaceDataset(h5ad_path=TRAIN_H5AD, k_neighbors=K_NEIGHBORS, pe_dim=PE_DIM, root=TRAIN_DATA_ROOT, train=True, gene_threshold=GENE_THRESHOLD, pca_neighbors=PCA_NEIGHBORS, seed=GLOBAL_SEED, dataset_name='spatial')
+        train_dataset = LaplaceDataset(
+            h5ad_path=TRAIN_H5AD, k_neighbors=K_NEIGHBORS, pe_dim=PE_DIM, root=TRAIN_DATA_ROOT, train=True,
+            gene_threshold=GENE_THRESHOLD, pca_neighbors=PCA_NEIGHBORS, seed=GLOBAL_SEED, dataset_name='spatial',
+            force_reprocess=FORCE_REPROCESS, use_pseudo_labels=USE_PSEUDO_LABELS,
+            cell_type_path=CELL_TYPE_PATH or None, cell_type_col=CELL_TYPE_COL, barcode_col=BARCODE_COL,
+            cell_type_unknown=CELL_TYPE_UNKNOWN
+        )
         
         if train_dataset and len(train_dataset) > 0:
             num_train_cells = train_dataset.get(0).num_nodes
@@ -1163,8 +1403,10 @@ if __name__ == '__main__':
             num_cell_types = train_dataset.num_cell_types
             filtered_gene_names_from_train = train_dataset.filtered_gene_names
             print(f"Training data: {num_train_cells} cells, {input_feature_dim} genes, {num_cell_types} types.")
-            
-            # Check for multimodal context
+        else:
+            raise ValueError("Training data is empty.")
+
+        # Check for multimodal context
         context_dim = 0
         if hasattr(train_dataset.get(0), 'chromatin') and train_dataset.get(0).chromatin is not None:
             context_dim = train_dataset.get(0).chromatin.size(1)
@@ -1228,98 +1470,123 @@ if __name__ == '__main__':
                 import numpy as np
                 from anndata import AnnData
                 from pathlib import Path
-                scvi_path = Path(SCVI_LOCAL_DIR) if SCVI_LOCAL_DIR else None
-                if (scvi_path is None or not scvi_path.exists()) and SCVI_HF_REPO:
-                    try:
-                        from huggingface_hub import snapshot_download
-                        scvi_path = Path(snapshot_download(repo_id=SCVI_HF_REPO, cache_dir="scvi_hub_cache"))
-                    except Exception as e:
-                        raise RuntimeError(f"HF download failed: {e}")
-                if scvi_path is None:
-                    raise RuntimeError("No scVI path provided (use --scvi_local_dir or --scvi_hf_repo).")
-
-                import scanpy as sc
-                # load reference genes from scVI snapshot adata
-                ref_adata = sc.read_h5ad(str(scvi_path / "adata.h5ad"))
-                ref_adata.var_names = ref_adata.var_names.astype(str)
-                ref_genes = ref_adata.var_names
-
-                X_train = train_dataset.get(0).x.cpu().numpy()
-                train_genes = train_dataset.filtered_gene_names if hasattr(train_dataset, 'filtered_gene_names') else None
-                if train_genes is None:
-                    raise RuntimeError("Train gene names missing; cannot align to scVI reference.")
-
-                # Align train counts to scVI reference genes
-                gene_to_idx = {g: i for i, g in enumerate(train_genes)}
-                X_aligned = np.zeros((X_train.shape[0], len(ref_genes)), dtype=X_train.dtype)
-                idx_target = []
-                idx_src = []
-                for i, g in enumerate(ref_genes):
-                    if g in gene_to_idx:
-                        idx_target.append(i)
-                        idx_src.append(gene_to_idx[g])
-                if idx_target:
-                    X_aligned[:, idx_target] = X_train[:, idx_src]
-
-                adata_scvi = AnnData(X=X_aligned)
-                adata_scvi.var_names = ref_genes.astype(str)
-
-                from scvi.model import SCVI
-                scvi_model = None
-                attr_path = scvi_path / "attr.pkl"
-                if attr_path.exists():
-                    scvi_model = SCVI.load(scvi_path, adata=adata_scvi)
-                else:
-                    # Fallback: load HF checkpoint directly (scvi-tools <1.0 compatible)
-                    # HF scVI checkpoint is trusted here; use full torch.load to avoid weights_only allowlist issues
-                    ckpt = torch.load(str(scvi_path / "model.pt"), map_location="cpu", weights_only=False)
-                    reg = ckpt.get("attr_dict", {}).get("registry_", {})
-                    x_state = reg.get("field_registries", {}).get("X", {}).get("state_registry", {})
-                    var_names = [str(v) for v in x_state.get("column_names", ref_genes)]
-                    batch_state = reg.get("field_registries", {}).get("batch", {}).get("state_registry", {})
-                    batch_categories = [str(v) for v in batch_state.get("categorical_mapping", ["0"])]
-
-                    gene_to_idx = {g: i for i, g in enumerate(train_genes)}
-                    X_aligned = np.zeros((X_train.shape[0], len(var_names)), dtype=X_train.dtype)
-                    idx_target, idx_src = [], []
-                    for i, g in enumerate(var_names):
-                        if g in gene_to_idx:
-                            idx_target.append(i)
-                            idx_src.append(gene_to_idx[g])
-                    if idx_target:
-                        X_aligned[:, idx_target] = X_train[:, idx_src]
-                    # Filter empty cells to avoid scvi warnings
-                    cell_sums = X_aligned.sum(axis=1)
-                    keep = cell_sums > 0
-                    X_aligned_filt = X_aligned[keep]
-                    adata_scvi = AnnData(X=X_aligned_filt)
-                    adata_scvi.var_names = np.array(var_names, dtype=str)
-                    adata_scvi.obs["batch"] = batch_categories[0]
+                if SCVI_TRAIN:
+                    from scvi.model import SCVI
+                    X_train = train_dataset.get(0).x.cpu().numpy()
+                    X_train = np.clip(np.rint(X_train), 0, None)
+                    train_genes = train_dataset.filtered_gene_names if hasattr(train_dataset, 'filtered_gene_names') else None
+                    if train_genes is None:
+                        train_genes = [f"gene_{i}" for i in range(X_train.shape[1])]
+                    adata_scvi = AnnData(X=X_train)
+                    adata_scvi.var_names = np.array(train_genes, dtype=str)
+                    adata_scvi.obs["batch"] = "train"
                     adata_scvi.obs["batch"] = adata_scvi.obs["batch"].astype("category")
-                    adata_scvi.obs["batch"] = adata_scvi.obs["batch"].cat.set_categories(batch_categories)
-
                     try:
                         import scvi
                         scvi.settings.verbosity = "error"
                     except Exception:
                         pass
                     SCVI.setup_anndata(adata_scvi, batch_key="batch")
-                    init_params = ckpt.get("attr_dict", {}).get("init_params_", {})
-                    non_kwargs = init_params.get("non_kwargs", {})
-                    kw_kwargs = init_params.get("kwargs", {}).get("kwargs", {})
-                    state = ckpt.get("model_state_dict", {})
-                    n_latent = state.get("z_encoder.mean_encoder.weight", torch.empty(0)).shape[0]
-                    n_hidden = state.get("z_encoder.encoder.fc_layers.Layer 0.0.weight", torch.empty(0)).shape[0]
-                    non_kwargs = dict(non_kwargs)
-                    if n_latent > 0:
-                        non_kwargs["n_latent"] = int(n_latent)
-                    if n_hidden > 0:
-                        non_kwargs["n_hidden"] = int(n_hidden)
-                    scvi_model = SCVI(adata_scvi, **non_kwargs, **kw_kwargs)
-                    scvi_model.module.load_state_dict(state, strict=True)
-                    scvi_model.is_trained_ = True
+                    scvi_model = SCVI(adata_scvi)
+                    scvi_model.train(max_epochs=SCVI_TRAIN_EPOCHS, batch_size=SCVI_TRAIN_BATCH_SIZE)
+                    if SCVI_TRAIN_DIR:
+                        scvi_model.save(SCVI_TRAIN_DIR, overwrite=True)
+                    scvi_latent = scvi_model.get_latent_representation(adata_scvi)
+                    keep = np.ones(X_train.shape[0], dtype=bool)
+                else:
+                    scvi_path = Path(SCVI_LOCAL_DIR) if SCVI_LOCAL_DIR else None
+                    if (scvi_path is None or not scvi_path.exists()) and SCVI_HF_REPO:
+                        try:
+                            from huggingface_hub import snapshot_download
+                            scvi_path = Path(snapshot_download(repo_id=SCVI_HF_REPO, cache_dir="scvi_hub_cache"))
+                        except Exception as e:
+                            raise RuntimeError(f"HF download failed: {e}")
+                    if scvi_path is None:
+                        raise RuntimeError("No scVI path provided (use --scvi_local_dir or --scvi_hf_repo).")
 
-                scvi_latent = scvi_model.get_latent_representation(adata_scvi)
+                    import scanpy as sc
+                    # load reference genes from scVI snapshot adata
+                    ref_adata = sc.read_h5ad(str(scvi_path / "adata.h5ad"))
+                    ref_adata.var_names = ref_adata.var_names.astype(str)
+                    ref_genes = ref_adata.var_names
+
+                    X_train = train_dataset.get(0).x.cpu().numpy()
+                    train_genes = train_dataset.filtered_gene_names if hasattr(train_dataset, 'filtered_gene_names') else None
+                    if train_genes is None:
+                        raise RuntimeError("Train gene names missing; cannot align to scVI reference.")
+
+                    # Align train counts to scVI reference genes
+                    gene_to_idx = {g: i for i, g in enumerate(train_genes)}
+                    X_aligned = np.zeros((X_train.shape[0], len(ref_genes)), dtype=X_train.dtype)
+                    idx_target = []
+                    idx_src = []
+                    for i, g in enumerate(ref_genes):
+                        if g in gene_to_idx:
+                            idx_target.append(i)
+                            idx_src.append(gene_to_idx[g])
+                    if idx_target:
+                        X_aligned[:, idx_target] = X_train[:, idx_src]
+
+                    adata_scvi = AnnData(X=X_aligned)
+                    adata_scvi.var_names = ref_genes.astype(str)
+
+                    from scvi.model import SCVI
+                    scvi_model = None
+                    attr_path = scvi_path / "attr.pkl"
+                    if attr_path.exists():
+                        scvi_model = SCVI.load(scvi_path, adata=adata_scvi)
+                        keep = np.ones(X_train.shape[0], dtype=bool)
+                    else:
+                        # Fallback: load HF checkpoint directly (scvi-tools <1.0 compatible)
+                        # HF scVI checkpoint is trusted here; use full torch.load to avoid weights_only allowlist issues
+                        ckpt = torch.load(str(scvi_path / "model.pt"), map_location="cpu", weights_only=False)
+                        reg = ckpt.get("attr_dict", {}).get("registry_", {})
+                        x_state = reg.get("field_registries", {}).get("X", {}).get("state_registry", {})
+                        var_names = [str(v) for v in x_state.get("column_names", ref_genes)]
+                        batch_state = reg.get("field_registries", {}).get("batch", {}).get("state_registry", {})
+                        batch_categories = [str(v) for v in batch_state.get("categorical_mapping", ["0"])]
+
+                        gene_to_idx = {g: i for i, g in enumerate(train_genes)}
+                        X_aligned = np.zeros((X_train.shape[0], len(var_names)), dtype=X_train.dtype)
+                        idx_target, idx_src = [], []
+                        for i, g in enumerate(var_names):
+                            if g in gene_to_idx:
+                                idx_target.append(i)
+                                idx_src.append(gene_to_idx[g])
+                        if idx_target:
+                            X_aligned[:, idx_target] = X_train[:, idx_src]
+                        # Filter empty cells to avoid scvi warnings
+                        cell_sums = X_aligned.sum(axis=1)
+                        keep = cell_sums > 0
+                        X_aligned_filt = X_aligned[keep]
+                        adata_scvi = AnnData(X=X_aligned_filt)
+                        adata_scvi.var_names = np.array(var_names, dtype=str)
+                        adata_scvi.obs["batch"] = batch_categories[0]
+                        adata_scvi.obs["batch"] = adata_scvi.obs["batch"].astype("category")
+                        adata_scvi.obs["batch"] = adata_scvi.obs["batch"].cat.set_categories(batch_categories)
+
+                        try:
+                            import scvi
+                            scvi.settings.verbosity = "error"
+                        except Exception:
+                            pass
+                        SCVI.setup_anndata(adata_scvi, batch_key="batch")
+                        init_params = ckpt.get("attr_dict", {}).get("init_params_", {})
+                        non_kwargs = init_params.get("non_kwargs", {})
+                        kw_kwargs = init_params.get("kwargs", {}).get("kwargs", {})
+                        state = ckpt.get("model_state_dict", {})
+                        n_latent = state.get("z_encoder.mean_encoder.weight", torch.empty(0)).shape[0]
+                        n_hidden = state.get("z_encoder.encoder.fc_layers.Layer 0.0.weight", torch.empty(0)).shape[0]
+                        non_kwargs = dict(non_kwargs)
+                        if n_latent > 0:
+                            non_kwargs["n_latent"] = int(n_latent)
+                        if n_hidden > 0:
+                            non_kwargs["n_hidden"] = int(n_hidden)
+                        scvi_model = SCVI(adata_scvi, **non_kwargs, **kw_kwargs)
+                        scvi_model.module.load_state_dict(state, strict=True)
+                        scvi_model.is_trained_ = True
+
+                    scvi_latent = scvi_model.get_latent_representation(adata_scvi)
                 scvi_context_full = np.zeros((X_train.shape[0], scvi_latent.shape[1]), dtype=scvi_latent.dtype)
                 scvi_context_full[keep] = scvi_latent
                 scvi_context = torch.tensor(scvi_context_full, device=device).float()
@@ -1333,7 +1600,6 @@ if __name__ == '__main__':
                 print(f"Warning: scVI context failed: {e}. Proceeding without scVI.")
                 USE_SCVI_CONTEXT = False
 
-        else: raise ValueError("Training data is empty.")
     except Exception as e:
         print(f"FATAL ERROR loading training data: {e}"); traceback.print_exc(); sys.exit(1)
 
@@ -1342,8 +1608,10 @@ if __name__ == '__main__':
         train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=0, drop_last=False)
         
         TOTAL_TRAINING_STEPS = len(train_loader) * EPOCHS
-        WARMUP_STEPS = max(1, int(0.05 * TOTAL_TRAINING_STEPS))
-        WARMUP_STEPS = min(WARMUP_STEPS, TOTAL_TRAINING_STEPS // 2)
+        WARMUP_STEPS = int(args.warmup)
+        if WARMUP_STEPS <= 0:
+            WARMUP_STEPS = max(1, int(0.05 * TOTAL_TRAINING_STEPS))
+        WARMUP_STEPS = min(WARMUP_STEPS, max(1, TOTAL_TRAINING_STEPS // 2))
 
         trainer = Trainer(in_dim=input_feature_dim, hid_dim=HIDDEN_DIM, lat_dim=LATENT_DIM, num_cell_types=num_cell_types,
                         pe_dim=PE_DIM, timesteps=TIMESTEPS_DIFFUSION, max_time=MAX_TIME, lr=LEARNING_RATE, warmup_steps=WARMUP_STEPS,
@@ -1352,10 +1620,16 @@ if __name__ == '__main__':
                         mask_rec_weight=MASK_REC_WEIGHT, kl_anneal_steps=KL_ANNEAL_STEPS, kl_free_bits=KL_FREE_BITS,
                         encoder_type=ENCODER_TYPE, batch_adv_weight=BATCH_ADV_WEIGHT, num_batches=num_batches,
                         context_align_weight=CONTEXT_ALIGN_WEIGHT, mask_strategy=MASK_STRATEGY, mask_gene_probs=mask_gene_probs,
-                        gene_stats_weight=GENE_STATS_WEIGHT, zero_rate_weight=ZERO_RATE_WEIGHT, disable_kl=DISABLE_KL,
+                        gene_stats_weight=GENE_STATS_WEIGHT, zero_rate_weight=ZERO_RATE_WEIGHT, cell_zero_rate_weight=CELL_ZERO_RATE_WEIGHT, disable_kl=DISABLE_KL,
                         cell_type_loss_weight=CELL_TYPE_LOSS_WEIGHT, dispersion_weight=DISPERSION_WEIGHT,
                         pi_temperature=PI_TEMPERATURE, pi_bias=PI_BIAS, diffusion_temperature=DIFFUSION_TEMPERATURE,
-                        pi_blend=PI_BLEND,
+                        diffusion_method=DIFFUSION_METHOD, simple_mode=SIMPLE_MODE,
+                        pi_blend=PI_BLEND, libsize_weight=LIBSIZE_WEIGHT,
+                        gen_calibrate_means=GEN_CALIBRATE_MEANS, gen_calibrate_zero=GEN_CALIBRATE_ZERO,
+                        gen_match_zero_per_cell=GEN_MATCH_ZERO_PER_CELL, gen_zero_per_cell_strength=GEN_ZERO_PER_CELL_STRENGTH,
+                        gen_mean_scale_clip_low=GEN_MEAN_SCALE_CLIP_LOW, gen_mean_scale_clip_high=GEN_MEAN_SCALE_CLIP_HIGH,
+                        transformer_layers=TRANSFORMER_LAYERS, transformer_heads=TRANSFORMER_HEADS, transformer_dropout=TRANSFORMER_DROPOUT,
+                        bio_positional=BIO_POSITIONAL, bio_pos_dim=BIO_POS_DIM,
                         gene_stats_anneal_steps=GENE_STATS_ANNEAL, zero_rate_anneal_steps=ZERO_RATE_ANNEAL)
         if USE_SCGEN_CONTEXT and scgen_context_stats is not None:
             trainer.scgen_context_stats = scgen_context_stats
@@ -1369,10 +1643,10 @@ if __name__ == '__main__':
             if hasattr(data0, 'x') and data0.x is not None and data0.x.numel() > 0:
                 x0f = data0.x.float()
                 trainer.zero_rate = (x0f == 0).float().mean(dim=0).cpu()
-                trainer.pi_blend = 0.1
                 trainer.gene_mean = x0f.mean(dim=0).cpu()
                 trainer.gene_var = x0f.var(dim=0, unbiased=False).cpu()
                 trainer.libsize_values = x0f.sum(dim=1).cpu().clamp(min=1.0)
+                trainer.zero_per_cell_values = (x0f == 0).sum(dim=1).cpu()
             if hasattr(data0, 'cell_type') and data0.cell_type is not None:
                 counts = torch.bincount(data0.cell_type, minlength=num_cell_types).float()
                 trainer.cell_type_probs = (counts / counts.sum()).cpu()
@@ -1405,16 +1679,22 @@ if __name__ == '__main__':
             checkpoint_freq = max(1, int(EPOCHS * 0.1))
             print(f"Checkpoint frequency: Every {checkpoint_freq} epochs (approx 10% of total time).")
 
+        stage2_start = STAGE2_START_EPOCH if STAGE2_START_EPOCH > 0 else max(1, EPOCHS // 2 + 1)
+        stage2_start = min(stage2_start, EPOCHS + 1)
         epoch_bar = tqdm(range(1, EPOCHS + 1), desc="Training", leave=True)
         best_gene_stats = float("inf")
         no_improve = 0
         for epoch in epoch_bar:
+            if epoch == 1:
+                trainer.set_stage(1, freeze_decoder=False)
+            if epoch == stage2_start:
+                trainer.set_stage(2, freeze_decoder=STAGE2_FREEZE_DECODER)
             (avg_total_loss, avg_diff_loss, avg_kl_loss,
-             avg_rec_loss, avg_mask_loss, avg_spec_loss, avg_gene_stats, avg_zero_rate) = trainer.train_epoch(train_loader, epoch)
+             avg_rec_loss, avg_mask_loss, avg_spec_loss, avg_gene_stats, avg_zero_rate, avg_cell_zero_rate) = trainer.train_epoch(train_loader, epoch)
             print(f"Epoch {epoch:03d}/{EPOCHS} Summary -> "
                   f"Total: {avg_total_loss:.4f}, Diff: {avg_diff_loss:.4f}, KL: {avg_kl_loss:.4f}, "
                   f"Rec: {avg_rec_loss:.4f}, MaskRec: {avg_mask_loss:.4f}, SpecAlign: {avg_spec_loss:.4f}, "
-                  f"GeneStats: {avg_gene_stats:.4f}, ZeroRate: {avg_zero_rate:.4f}, "
+                  f"GeneStats: {avg_gene_stats:.4f}, ZeroRate: {avg_zero_rate:.4f}, CellZeroRate: {avg_cell_zero_rate:.4f}, "
                   f"LR: {trainer.optim.param_groups[0]['lr']:.3e}")
             if EARLY_STOP_GENE_STATS:
                 if avg_gene_stats + EARLY_STOP_MIN_DELTA < best_gene_stats:
@@ -1443,47 +1723,34 @@ if __name__ == '__main__':
         print("ERROR: Filtered gene names from training not available. Skipping evaluation.")
     else:
         try:
-            print(f"Loading test data from: {TEST_H5AD}")
-            test_adata_raw = sc.read_h5ad(TEST_H5AD)
-            print(f"DEBUG: Loaded Test Data Shape: {test_adata_raw.shape}")
-            
-            # --- Auto-Annotation / Clustering ---
-            possible_keys = ['cell_type', 'celltype', 'CellType', 'cluster', 'Cluster', 'clusters', 'leiden', 'annotation', 'subclass']
-            found_key = None
-            for key in possible_keys:
-                if key in test_adata_raw.obs.columns:
-                    found_key = key
-                    break
-            
-            if found_key:
-                print(f"DEBUG: Found cell type column: '{found_key}'. Renaming to 'cell_type'.")
-                test_adata_raw.obs['cell_type'] = test_adata_raw.obs[found_key]
+            test_dataset = LaplaceDataset(
+                h5ad_path=TRAIN_H5AD, k_neighbors=K_NEIGHBORS, pe_dim=PE_DIM, root=TEST_DATA_ROOT, train=False,
+                gene_threshold=GENE_THRESHOLD, pca_neighbors=PCA_NEIGHBORS, seed=GLOBAL_SEED, dataset_name='spatial',
+                force_reprocess=FORCE_REPROCESS, use_pseudo_labels=USE_PSEUDO_LABELS,
+                cell_type_path=CELL_TYPE_PATH or None, cell_type_col=CELL_TYPE_COL, barcode_col=BARCODE_COL,
+                cell_type_unknown=CELL_TYPE_UNKNOWN
+            )
+            if test_dataset and len(test_dataset) > 0:
+                data_test = test_dataset.get(0)
+                X_test_tensor = data_test.x
+                cell_types_test = data_test.cell_type
+                test_adata_raw = sc.AnnData(X=X_test_tensor.cpu().numpy())
+                test_adata_raw.obs['cell_type'] = cell_types_test.cpu().numpy()
+                test_adata_raw.var_names = test_dataset.filtered_gene_names if hasattr(test_dataset, 'filtered_gene_names') else filtered_gene_names_from_train
+                if hasattr(data_test, "pos") and data_test.pos is not None and data_test.pos.numel() > 0:
+                    test_adata_raw.obsm['spatial'] = data_test.pos.cpu().numpy()
+                print(f"Test data loaded: {test_adata_raw.shape[0]} cells.")
             else:
-                print("Warning: 'cell_type' (or synonyms) NOT found in test columns. Performing basic clustering (Leiden) to generate labels for conditional evaluation.")
-                try:
-                    print("Running PCA/Neighbors/Leiden on Test Data...")
-                    if test_adata_raw.is_view: test_adata_raw = test_adata_raw.copy()
-                    
-                    adata_for_clustering = test_adata_raw.copy()
-                    sc.pp.normalize_total(adata_for_clustering, target_sum=1e4)
-                    sc.pp.log1p(adata_for_clustering)
-                    sc.pp.pca(adata_for_clustering, n_comps=50)
-                    sc.pp.neighbors(adata_for_clustering, n_neighbors=10)
-                    sc.tl.leiden(adata_for_clustering, key_added='cell_type', resolution=0.5)
-                    
-                    test_adata_raw.obs['cell_type'] = adata_for_clustering.obs['cell_type'].values
-                    print(f"Generated {len(test_adata_raw.obs['cell_type'].unique())} Leiden clusters as proxy cell types.")
-                    del adata_for_clustering
-                except Exception as e_cluster:
-                    print(f"Error during fallback clustering: {e_cluster}. Conditional generation will be skipped.")
+                print("Test dataset empty.")
+                test_adata_raw = None
 
             # --- Robust Alignment ---
             print("Aligning test data to training feature space (Robust Strategy)...")
             target_genes = filtered_gene_names_from_train
             n_target = len(target_genes)
-            n_cells = test_adata_raw.shape[0]
+            n_cells = test_adata_raw.shape[0] if test_adata_raw is not None else 0
             
-            test_gene_to_idx = {gene: i for i, gene in enumerate(test_adata_raw.var_names)}
+            test_gene_to_idx = {gene: i for i, gene in enumerate(test_adata_raw.var_names)} if test_adata_raw is not None else {}
             src_indices = []
             dst_indices = []
             found_genes_count = 0
@@ -1496,7 +1763,7 @@ if __name__ == '__main__':
             
             print(f"DEBUG: Found {found_genes_count} / {n_target} training genes in test set.")
             
-            if found_genes_count == 0:
+            if test_adata_raw is None or found_genes_count == 0:
                 print("FATAL ERROR: Zero overlap between training and test genes."); test_adata = None
             else:
                 X_test_source = test_adata_raw.X
@@ -1590,7 +1857,7 @@ if __name__ == '__main__':
 
         # qualitative plots (last dataset)
         if generated_datasets_counts and VIZ:
-             output_plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qualitative_evaluation_plots_v2")
+             output_plot_dir = _experiment_plot_dir(args, "spatial")
              current_train_cell_type_categories = ["Unknown"]
              if train_dataset and hasattr(train_dataset, 'cell_type_categories'): current_train_cell_type_categories = train_dataset.cell_type_categories
              

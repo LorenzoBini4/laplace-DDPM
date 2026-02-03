@@ -183,6 +183,41 @@ class MLPEncoder(nn.Module):
         logvar = self.logvar_net(h)
         return mu, logvar
 
+class GlobalTransformerEncoder(nn.Module):
+    def __init__(self, in_dim, hid_dim, lat_dim, pe_dim=0, num_layers=2, num_heads=8, dropout=0.1):
+        super().__init__()
+        self.pe_dim = pe_dim
+        input_dim = in_dim + pe_dim
+        self.in_proj = nn.Linear(input_dim, hid_dim)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hid_dim,
+            nhead=num_heads,
+            dim_feedforward=hid_dim * 4,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.norm = nn.LayerNorm(hid_dim)
+        self.mu_net = nn.Linear(hid_dim, lat_dim)
+        self.logvar_net = nn.Linear(hid_dim, lat_dim)
+
+    def forward(self, x, edge_index=None, lap_pe=None, edge_weight=None, edge_index_phys=None, edge_weight_phys=None):
+        current_device = x.device
+        num_nodes = x.size(0)
+        if num_nodes == 0:
+            return torch.empty(0, self.mu_net.out_features, device=current_device, dtype=x.dtype), \
+                    torch.empty(0, self.logvar_net.out_features, device=current_device, dtype=x.dtype)
+
+        if lap_pe is None or lap_pe.size(0) != num_nodes or lap_pe.size(1) != self.pe_dim:
+            lap_pe = torch.zeros(num_nodes, self.pe_dim, device=current_device, dtype=x.dtype)
+        x_combined = torch.cat([x, lap_pe], dim=1)
+        h = self.in_proj(x_combined).unsqueeze(0)  # (1, N, H)
+        h = self.encoder(h)
+        h = self.norm(h).squeeze(0)
+        mu = self.mu_net(h)
+        logvar = self.logvar_net(h)
+        return mu, logvar
+
 class ScoreNet(nn.Module):
     def __init__(self, lat_dim, num_cell_types, time_embed_dim=32, hid_dim_mlp=512, context_dim=0, num_layers=3): 
         super().__init__()
@@ -304,7 +339,7 @@ class ScoreSDE(nn.Module):
         return torch.sqrt(1. - torch.exp(-2 * t) + 1e-8)
 
     @torch.no_grad()
-    def sample(self, z_shape, cell_type_labels=None, context_embedding=None, temperature=1.0):
+    def sample(self, z_shape, cell_type_labels=None, context_embedding=None, temperature=1.0, method="sde"):
         current_device = self.timesteps.device
         num_samples, lat_dim = z_shape
         if num_samples == 0: return torch.empty(z_shape, device=current_device, dtype=torch.float32)
@@ -326,11 +361,20 @@ class ScoreSDE(nn.Module):
             t_tensor_for_model = torch.full((num_samples,), t_val_float, device=current_device, dtype=z.dtype)
             sigma_t = self.marginal_std(t_val_float)
             predicted_epsilon = self.score_model(z, t_tensor_for_model, cell_type_labels, context_embedding=context_embedding)
-            sigma_t_safe = sigma_t + 1e-8
-            drift = 2 * predicted_epsilon / sigma_t_safe
-            diffusion_coeff_input = torch.tensor(2 * dt + 1e-8, device=current_device, dtype=z.dtype)
-            diffusion_coeff = torch.sqrt(diffusion_coeff_input)
-            z = z + drift * dt + diffusion_coeff * torch.randn_like(z) * float(temperature)
+
+            if method == "ddim":
+                alpha_t = torch.exp(torch.tensor(-t_val_float, device=current_device, dtype=z.dtype))
+                z0_hat = (z - sigma_t * predicted_epsilon) / (alpha_t + 1e-8)
+                t_prev = self.timesteps[i + 1].item() if i + 1 < self.N else 0.0
+                alpha_prev = torch.exp(torch.tensor(-t_prev, device=current_device, dtype=z.dtype))
+                sigma_prev = self.marginal_std(t_prev)
+                z = alpha_prev * z0_hat + sigma_prev * predicted_epsilon
+            else:
+                sigma_t_safe = sigma_t + 1e-8
+                drift = 2 * predicted_epsilon / sigma_t_safe
+                diffusion_coeff_input = torch.tensor(2 * dt + 1e-8, device=current_device, dtype=z.dtype)
+                diffusion_coeff = torch.sqrt(diffusion_coeff_input)
+                z = z + drift * dt + diffusion_coeff * torch.randn_like(z) * float(temperature)
         return z
 
     def sample_guided(self, z_shape, guidance_fn, cell_type_labels=None, context_embedding=None, guidance_scale=1.0, temperature=1.0):
