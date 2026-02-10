@@ -1,6 +1,6 @@
 # LapDDPM: A Conditional Graph Diffusion Model for scRNA-seq Generation with Spectral Adversarial Perturbations
 
-This repository contains the official PyTorch implementation for the paper: [**"LapDDPM: A Conditional Graph Diffusion Model for scRNA-seq Generation with Spectral Adversarial Perturbations"**](https://arxiv.org/abs/2506.13344), published at the ICML 2025 [GenBio Workshop: The Second Workshop on Generative AI and Biology, Vancouver](https://genbio-workshop.github.io/2025/).
+This repository contains the official PyTorch implementation for the paper: [**"LapDDPM: A Conditional Graph Diffusion Model for scRNA-seq Generation with Spectral Adversarial Perturbations"**](https://arxiv.org/pdf/2506.13344), published at the ICML 2025 [GenBio Workshop: The Second Workshop on Generative AI and Biology, Vancouver](https://genbio-workshop.github.io/2025/).
 
 ## Abstract
 
@@ -8,36 +8,31 @@ Generating high-fidelity and biologically plausible synthetic single-cell RNA se
 
 ---
 
-## Repository Structure
-
-The repository is organized as follows:
+## Repository Structure (Current)
 
 ```
 .
-├── data/                   # Directory for datasets
-│   ├── pbmc3k_train.h5ad   # Example raw training data
-│   ├── pbmc3k_test.h5ad    # Example raw test data
-│   └── pbmc3k_processed/   # Directory for pre-processed data (auto-generated)
-│       └── train_k.../
-├── pbmc3k/                 # Python package for the PBMC3K dataset
-│   ├── dataset.py          # Data loading and pre-processing logic
-│   ├── models.py           # Model components (Encoder, Decoder, ScoreNet)
-│   ├── utils.py            # Utility functions
-│   └── ...
-├── denta/                  # Python package for the Dentate Gyrus dataset
-│   └── ...
-├── results/                # Directory for storing results and checkpoints (e.g., metrics)
-├── run_pbmc3k.py           # Main script to run experiments on PBMC3K
-├── run_denta.py            # Main script to run experiments on Dentate Gyrus
-├── main.sh                 # Example shell script for execution
-├── main.slurm              # Example Slurm script for HPC execution
-└── README.md               # This file
+├── experiments/                 # All experiment code, slurm, logs, plots
+│   ├── spatial/                 # Spatial (Visium) runs
+│   ├── multiome/                # Multiome runs
+│   ├── baselines/               # scVI/scANVI and MultiVI baselines
+│   ├── label_transfer/          # Label transfer utilities and jobs
+│   ├── sweeps/                  # Hyperparameter sweeps
+│   ├── unimodal/                # PBMC3K / Dentate runs
+│   └── scripts/                 # Plotting / figure scripts
+├── data/
+│   ├── raw/                     # Raw datasets (.h5ad, .h5)
+│   ├── processed/               # Preprocessed graph data
+│   └── labels/                  # Transferred cell-type labels
+├── paper/CHIL/                  # Paper sources and figures
+└── README.md
 ```
 
--   **`pbmc3k/`** and **`denta/`**: These are Python modules containing the core logic for their respective datasets, including data processing (`dataset.py`), model definitions (`models.py`), and helper functions (`utils.py`).
--   **`data/`**: This directory stores all datasets. Raw data (e.g., in `.h5ad` format) should be placed here. The `run_*.py` scripts will automatically process this data and save the results in corresponding `*_processed` subdirectories.
--   **`run_*.py`**: These are the main executable scripts for training and evaluating the LapDDPM model on a specific dataset. Hyperparameters are configured within these files.
--   **`main.sh` / `main.slurm`**: Example scripts demonstrating how to execute a run and redirect output to log files.
+- **`experiments/*/slurm`** contains SLURM entrypoints.
+- **`experiments/*/logs`** contains run logs.
+- **`experiments/qualitative_evaluation_plots_v2`** contains generated plots.
+- **`data/raw`** holds Visium + Multiome files.
+- **`data/processed`** holds cached graph data.
 
 ---
 
@@ -70,61 +65,38 @@ The repository is organized as follows:
 
 ## Data Preparation
 
-1.  Place your raw training and test datasets in the `data/` directory. The scripts are currently configured to read `.h5ad` files. For example:
-    - `data/pbmc3k_train.h5ad`
-    - `data/pbmc3k_test.h5ad`
-    - `data/dentategyrus_train.h5ad`
-    - `data/dentategyrus_test.h5ad`
+1. Place raw datasets in `data/raw/`:
+   - `data/raw/visium_lymph_node.h5ad`
+   - `data/raw/lymph_node_lymphoma_14k_raw_feature_bc_matrix.h5`
 
-2.  The `run_*.py` scripts will handle the rest. On the first run, the script will:
+2. Scripts handle preprocessing. On first run they will:
     -   Load the raw data.
     -   Filter genes based on the `GENE_THRESHOLD`.
     -   Construct a k-NN graph and compute Laplacian Positional Encodings (LPEs).
-    -   Save the processed `torch_geometric.data.Data` object into a subdirectory within `data/<dataset_name>_processed/`. The subdirectory name is determined by the preprocessing hyperparameters (e.g., `k`, `pe_dim`, `pca_neighbors`). Subsequent runs with the same parameters will load the processed data directly, saving time.
+    - Save processed `torch_geometric.data.Data` under `data/processed/<dataset>/train_k...`.
 
 ---
 
 ## Training and Evaluation
 
-The model can be trained and evaluated by running the corresponding script for your dataset.
-
-### 1. Configure Hyperparameters
-
-All hyperparameters for a run can be modified at the top of the relevant script (e.g., `run_pbmc3k.py`):
-
-```python
-# In run_pbmc3k.py
-BATCH_SIZE = 64
-LEARNING_RATE = 1e-3
-EPOCHS = 1500
-HIDDEN_DIM = 1024
-LATENT_DIM = 1024
-PE_DIM = 50
-K_NEIGHBORS = 50
-# ... and so on
-```
-
-### 2. Run the Experiment
-
-You can execute the script directly from the command line. The `main.sh` script provides a convenient way to do this and log the output:
+Run via SLURM scripts in `experiments/*/slurm` (recommended):
 
 ```bash
-bash main.sh
+sbatch experiments/spatial/slurm/train_spatial.slurm
+sbatch experiments/multiome/slurm/train_multiome.slurm
 ```
 
-This will execute the `run_pbmc3k.py` script for the Pbmc3k dataset, and all standard output and errors will be saved to `scrna_ddpm.out` and `scrna_ddpm.err`, respectively.
-
-To run the experiment for the Dentate Gyrus dataset, simply modify `main.sh` to call `run_denta.py`.
-
-For execution on an HPC cluster using the Slurm workload manager, you can use the provided `main.slurm` script. Submit the job using `sbatch`:
-
+Label transfer (for cell types):
 ```bash
-sbatch main.slurm
+sbatch experiments/label_transfer/slurm/label_transfer_spatial.slurm
+sbatch experiments/label_transfer/slurm/label_transfer_multiome.slurm
 ```
 
-This will execute the `run_pbmc3k.py` script, and all standard output and errors will be saved to `scrna_ddpm.out` and `scrna_ddpm.err`, respectively.
-
-To run the experiment for the Dentate Gyrus dataset, simply modify `main.sh` to call `run_denta.py`.
+Baselines:
+```bash
+sbatch experiments/baselines/spatial/slurm/baseline_spatial_scvi_scanvi.slurm
+sbatch experiments/baselines/multiome/slurm/baseline_multiome_multivi.slurm
+```
 
 ### 3. Output
 
