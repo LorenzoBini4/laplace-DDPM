@@ -48,6 +48,11 @@ def generate_qualitative_plots(real_adata_filtered, generated_counts, generated_
     else:
         real_counts_np = np.asarray(real_adata_filtered.X)
 
+    if isinstance(generated_counts, torch.Tensor):
+        generated_counts = generated_counts.detach().cpu().numpy()
+    elif sp.issparse(generated_counts):
+        generated_counts = generated_counts.toarray()
+
     # --- figure 1a: Mean-Variance Plot ---
     print("Plotting Figure 1a: Mean-Variance Relationship...")
     if real_counts_np.shape[0] > 0 and generated_counts.shape[0] > 0 and \
