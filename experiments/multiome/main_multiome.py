@@ -40,6 +40,103 @@ except ImportError as e:
     print(f"Missing required library: {e}.")
     pass
 
+def _maybe_init_wandb(args):
+    if not getattr(args, "use_wandb", False):
+        return None
+    try:
+        import wandb
+    except ImportError as e:
+        print(f"wandb not installed: {e}. Run `pip install wandb`.")
+        return None
+    init_kwargs = {
+        "project": args.wandb_project,
+        "config": vars(args),
+        "mode": args.wandb_mode,
+    }
+    if args.wandb_entity:
+        init_kwargs["entity"] = args.wandb_entity
+    if args.wandb_run_name:
+        init_kwargs["name"] = args.wandb_run_name
+    if args.wandb_group:
+        init_kwargs["group"] = args.wandb_group
+    if args.wandb_job_type:
+        init_kwargs["job_type"] = args.wandb_job_type
+    if args.wandb_notes:
+        init_kwargs["notes"] = args.wandb_notes
+    tags = [t.strip() for t in args.wandb_tags.split(",") if t.strip()]
+    if tags:
+        init_kwargs["tags"] = tags
+    return wandb.init(**init_kwargs)
+
+def _wandb_log(run, data, step=None):
+    if run is None or not isinstance(data, dict) or not data:
+        return
+    try:
+        run.log(data, step=step)
+    except Exception as e:
+        print(f"wandb log error: {e}")
+
+def _flatten_metrics(prefix, metrics):
+    flat = {}
+    if not isinstance(metrics, dict):
+        return flat
+    for k, v in metrics.items():
+        if isinstance(v, dict):
+            for kk, vv in v.items():
+                try:
+                    flat[f"{prefix}/{k}/{kk}"] = float(vv)
+                except Exception:
+                    pass
+        else:
+            try:
+                flat[f"{prefix}/{k}"] = float(v)
+            except Exception:
+                pass
+    return flat
+
+def _coerce_bool_args(args, keys):
+    for k in keys:
+        if not hasattr(args, k):
+            continue
+        env_key = f"BOOL_OVERRIDE_{k}"
+        env_val = os.environ.get(env_key)
+        if env_val is not None:
+            lv = str(env_val).strip().lower()
+            if lv in ("true", "1", "yes", "y", "t"):
+                setattr(args, k, True)
+            elif lv in ("false", "0", "no", "n", "f", ""):
+                setattr(args, k, False)
+        v = getattr(args, k)
+        if isinstance(v, str):
+            lv = v.strip().lower()
+            if lv in ("true", "1", "yes", "y", "t"):
+                setattr(args, k, True)
+            elif lv in ("false", "0", "no", "n", "f", ""):
+                setattr(args, k, False)
+    return args
+
+def _wandb_log_image_dir(run, dir_path, step=None, prefix="plots"):
+    if run is None or not dir_path or not os.path.isdir(dir_path):
+        return
+    try:
+        import wandb
+    except ImportError:
+        return
+    exts = (".png", ".jpg", ".jpeg")
+    images = []
+    for root, _, files in os.walk(dir_path):
+        for fn in sorted(files):
+            if fn.lower().endswith(exts):
+                images.append(os.path.join(root, fn))
+    if not images:
+        return
+    for path in images:
+        key = f"{prefix}/{os.path.basename(path)}"
+        try:
+            run.log({key: wandb.Image(path)}, step=step)
+        except Exception as e:
+            print(f"wandb image log error ({path}): {e}")
+
 def sliced_wasserstein_gpu(X, Y, num_projections=50, seed=42):
     """
     Computes Sliced Wasserstein Distance (SWD) between two high-dimensional distributions X and Y on GPU.
@@ -1189,7 +1286,26 @@ if __name__ == '__main__':
     parser.add_argument('--stage2_start_epoch', type=int, default=0)
     parser.add_argument('--stage2_freeze_decoder', action='store_true', default=False)
     parser.add_argument('--plot_tag', type=str, default="")
+    parser.add_argument('--use_wandb', action='store_true', default=False)
+    parser.add_argument('--wandb_project', type=str, default="laplace-DDPM")
+    parser.add_argument('--wandb_entity', type=str, default="")
+    parser.add_argument('--wandb_run_name', type=str, default="")
+    parser.add_argument('--wandb_group', type=str, default="")
+    parser.add_argument('--wandb_job_type', type=str, default="")
+    parser.add_argument('--wandb_tags', type=str, default="")
+    parser.add_argument('--wandb_notes', type=str, default="")
+    parser.add_argument('--wandb_mode', type=str, default="online", choices=["online", "offline", "disabled"])
+    parser.add_argument('--wandb_log_freq', type=int, default=1)
     args = parser.parse_args()
+
+    _coerce_bool_args(args, [
+        "use_scgen_context", "use_scvi_context", "scvi_train", "use_pseudo_labels",
+        "stage2_freeze_decoder", "force_reprocess", "early_stop_gene_stats",
+        "gen_calibrate_means", "gen_calibrate_zero", "gen_match_zero_per_cell",
+        "bio_positional", "dual_graph", "disable_kl", "eval_only", "simple_mode",
+        "use_wandb", "viz",
+    ])
+    wandb_run = _maybe_init_wandb(args)
 
     BATCH_SIZE = args.batch_size
     LEARNING_RATE = args.lr
@@ -1266,6 +1382,7 @@ if __name__ == '__main__':
     STAGE2_FREEZE_DECODER = args.stage2_freeze_decoder
     
     set_seed(GLOBAL_SEED)
+    last_epoch = 0
     loss_weights = {'diff': args.loss_weight_diff, 'kl': args.loss_weight_kl, 'rec': args.loss_weight_rec}
 
     # PATHS FOR MULTIOME
@@ -1581,6 +1698,25 @@ if __name__ == '__main__':
                   f"Total: {avg_total_loss:.4f} | Diff: {avg_diff_loss:.4f} | KL: {avg_kl_loss:.4f} | "
                   f"Rec: {avg_rec_loss:.4f} | MaskRec: {avg_mask_loss:.4f} | SpecAlign: {avg_spec_loss:.4f} | "
                   f"GeneStats: {avg_gene_stats:.4f} | ZeroRate: {avg_zero_rate:.4f} | CellZeroRate: {avg_cell_zero_rate:.4f}")
+            last_epoch = epoch
+            if args.use_wandb and (epoch % max(1, args.wandb_log_freq) == 0):
+                _wandb_log(
+                    wandb_run,
+                    {
+                        "train/total_loss": avg_total_loss,
+                        "train/diff_loss": avg_diff_loss,
+                        "train/kl_loss": avg_kl_loss,
+                        "train/rec_loss": avg_rec_loss,
+                        "train/mask_rec_loss": avg_mask_loss,
+                        "train/spec_loss": avg_spec_loss,
+                        "train/gene_stats": avg_gene_stats,
+                        "train/zero_rate": avg_zero_rate,
+                        "train/cell_zero_rate": avg_cell_zero_rate,
+                        "train/lr": trainer.optim.param_groups[0]["lr"],
+                        "train/stage": 2 if epoch >= stage2_start else 1,
+                    },
+                    step=epoch,
+                )
             if EARLY_STOP_GENE_STATS:
                 if avg_gene_stats + EARLY_STOP_MIN_DELTA < best_gene_stats:
                     best_gene_stats = avg_gene_stats
@@ -1589,6 +1725,7 @@ if __name__ == '__main__':
                     no_improve += 1
                 if no_improve >= EARLY_STOP_PATIENCE:
                     print(f"Early stopping: gene_stats did not improve for {EARLY_STOP_PATIENCE} epochs.")
+                    _wandb_log(wandb_run, {"train/early_stop": 1}, step=epoch)
                     break
                 if epoch % checkpoint_freq == 0 or epoch == EPOCHS:
                     torch.save(trainer.state_dict(), os.path.join(TRAIN_DATA_ROOT, f'trainer_checkpoint_epoch_{epoch}.pt'))
@@ -1733,6 +1870,12 @@ if __name__ == '__main__':
 
                  # Marker Gene Conservation
                  markers = trainer.evaluate_marker_genes(real_adata=test_adata, generated_counts=gen_counts, generated_cell_types=gen_types)
+                 eval_log = {}
+                 eval_log.update(_flatten_metrics(f"eval/dataset_{i+1}", metrics))
+                 eval_log.update(_flatten_metrics(f"eval/dataset_{i+1}/tstr", tstr))
+                 eval_log.update(_flatten_metrics(f"eval/dataset_{i+1}/grn", grn))
+                 eval_log.update(_flatten_metrics(f"eval/dataset_{i+1}/markers", markers))
+                 _wandb_log(wandb_run, eval_log, step=last_epoch)
 
                  if VIZ:
                       output_plot_dir = _experiment_plot_dir(args, "multiome")
@@ -1742,6 +1885,7 @@ if __name__ == '__main__':
                           output_dir=output_plot_dir,
                           model_name="LapDDPM"
                       )
+                      _wandb_log_image_dir(wandb_run, output_plot_dir, step=last_epoch, prefix="plots/multiome")
 
                  if "MMD" in metrics:
                       for k, v in metrics["MMD"].items():
@@ -1782,5 +1926,11 @@ if __name__ == '__main__':
                   output_dir=output_plot_dir,
                   model_name="LapDDPM"
               )
+              _wandb_log_image_dir(wandb_run, output_plot_dir, step=last_epoch, prefix="plots/multiome")
              
     print("\nScript execution finished.")
+    if wandb_run is not None:
+        try:
+            wandb_run.finish()
+        except Exception as e:
+            print(f"wandb finish error: {e}")

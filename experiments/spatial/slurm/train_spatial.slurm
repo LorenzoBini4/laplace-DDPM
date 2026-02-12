@@ -8,7 +8,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --error run_train_spatial.e%j     
 #SBATCH --output run_train_spatial.o%j      
-#SBATCH --time 0-01:59:59
+#SBATCH --time 0-04:59:59
 
 nvidia-smi
 REPO_ROOT="./"
@@ -17,7 +17,7 @@ cd "$REPO_ROOT"
 export PYTHONPATH="$REPO_ROOT/experiments:$PYTHONPATH"
 
 python3 "$REPO_ROOT/experiments/spatial/main_spatial.py" --seed 77 --batch_size 8 --hidden_dim 512 --latent_dim 256 --lr 4e-4 \
-    --epochs 10000 --warmup 1000 --force_reprocess --stage2_start_epoch 160 \
+    --epochs 1000 --warmup 100 --force_reprocess --stage2_start_epoch 120 \
     --input_masking_fraction 0.0 \
     --loss_weight_diff 0.5 --loss_weight_kl 0.05 --loss_weight_rec 3.0 --spectral_loss_weight 0.0 --mask_rec_weight 0.0 \
     --batch_adv_weight 0.0 --context_align_weight 0.0 --mask_strategy random \
@@ -27,8 +27,10 @@ python3 "$REPO_ROOT/experiments/spatial/main_spatial.py" --seed 77 --batch_size 
     --gen_mean_scale_clip_low 0.1 --gen_mean_scale_clip_high 10.0 \
     --cell_type_path data/labels/spatial_cell_types.tsv \
     --gene_stats_anneal_steps 200 --zero_rate_anneal_steps 200 \
-    --early_stop_gene_stats --early_stop_patience 2000 --early_stop_min_delta 1e-5 \
+    --early_stop_gene_stats --early_stop_patience 500 --early_stop_min_delta 1e-5 \
     --kl_anneal_steps 200 --kl_free_bits 0.5 \
     --encoder_type transformer --transformer_layers 4 --transformer_heads 8 --transformer_dropout 0.1 \
     --knn 30 --pe_dim 50 --pca_dim 50 --gene_threshold 20 --timesteps_diffusion 1000 --viz True \
-    --max_time 1.0
+    --max_time 1.0 \
+    --use_wandb --wandb_project laplace-DDPM --wandb_group spatial --wandb_job_type train --wandb_tags spatial \
+    --wandb_run_name "spatial_${SLURM_JOB_ID:-local}"
